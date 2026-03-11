@@ -23,3 +23,7 @@ From any project directory:
 ```sh
 claude-docker.sh
 ```
+
+## Is this safe?
+
+The [script](claude-docker.sh) is short (~40 lines). If you're unsure, paste it into Claude and ask _"Is this script safe to run?"_
