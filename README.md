@@ -23,7 +23,3 @@ From any project directory:
 ```sh
 claude-docker.sh
 ```
-
-## Note
-
-Remove `--gpus all` from the script if you don't have an NVIDIA GPU.

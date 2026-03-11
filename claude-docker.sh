@@ -20,11 +20,16 @@ ENV PATH=/home/node/.npm-global/bin:$PATH
 RUN npm install -g @anthropic-ai/claude-code
 EOF
 
+GPU_FLAG=""
+if docker info --format '{{.Runtimes}}' | grep -q nvidia; then
+  GPU_FLAG="--gpus all"
+fi
+
 echo "==> Starting Claude..."
 exec docker run -it --rm \
   --name "claude-$(basename "$PROJECT_DIR")" \
   --network host \
-  --gpus all \
+  $GPU_FLAG \
   -v "$PROJECT_DIR":"$PROJECT_DIR" \
   -v "$HOME/.claude":/home/node/.claude \
   --tmpfs /home/node/.claude/projects:uid=1000,gid=1000 \
