@@ -1,0 +1,29 @@
+{
+  "name": "Claude Code",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "runArgs": [
+    "--network", "host",
+    "--gpus", "all"
+  ],
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind",
+    "source=${localEnv:HOME}/.claude.json,target=/home/node/.claude.json,type=bind",
+    "source=claude-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=claude-projects-${devcontainerId},target=/home/node/.claude/projects,type=volume"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "containerEnv": {
+    "TERM": "xterm-256color",
+    "SSH_AUTH_SOCK": "",
+    "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS": "true"
+  },
+  "postCreateCommand": "git config --global credential.helper ''",
+  "remoteUser": "node"
+}
