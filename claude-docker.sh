@@ -253,7 +253,11 @@ else
   for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
     [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
   done
-  [ -n "$GPU_FLAG" ] && echo "==> GPU: NVIDIA (device passthrough)"
+  if [ -n "$GPU_FLAG" ]; then
+    echo "==> GPU: NVIDIA (device passthrough)"
+    echo "    Tip: install nvidia-container-toolkit for full GPU support:"
+    echo "         $(dirname "${BASH_SOURCE[0]}")/setup-gpu.sh"
+  fi
 fi
 
 # AMD/Intel: DRI render nodes and AMD KFD compute device
