@@ -245,9 +245,25 @@ CMD ["claude", "--dangerously-skip-permissions"]
 EOF
 
 GPU_FLAG=""
-if docker info --format '{{.Runtimes}}' | grep -q nvidia; then
+# NVIDIA: prefer container runtime, fall back to explicit device passthrough
+if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
   GPU_FLAG="--gpus all"
+  echo "==> GPU: NVIDIA (nvidia container runtime)"
+else
+  for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+    [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
+  done
+  [ -n "$GPU_FLAG" ] && echo "==> GPU: NVIDIA (device passthrough)"
 fi
+
+# AMD/Intel: DRI render nodes and AMD KFD compute device
+for dev in /dev/dri/renderD*; do
+  [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
+done
+if [ -c /dev/kfd ]; then
+  GPU_FLAG="$GPU_FLAG --device /dev/kfd"
+fi
+[ -n "$(echo "$GPU_FLAG" | grep -o '/dev/dri\|/dev/kfd')" ] && echo "==> GPU: AMD/Intel (DRI render nodes)"
 
 # ── Build env-specific docker flags ──────────────────────────────────
 ENV_MOUNTS=""
