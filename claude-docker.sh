@@ -11,7 +11,7 @@ docker build -t "$IMAGE_NAME" -f - "$PROJECT_DIR" <<'EOF'
 FROM node:22-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv git \
     && rm -rf /var/lib/apt/lists/*
 
 USER node
@@ -25,6 +25,13 @@ if docker info --format '{{.Runtimes}}' | grep -q nvidia; then
   GPU_FLAG="--gpus all"
 fi
 
+# Mount host tools that are already installed into a guaranteed-in-PATH location
+HOST_TOOL_MOUNTS=""
+for tool in gh; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [ -n "$tool_path" ] && HOST_TOOL_MOUNTS="$HOST_TOOL_MOUNTS -v $tool_path:/usr/local/bin/$tool:ro"
+done
+
 echo "==> Starting Claude..."
 exec docker run -it --rm \
   --name "claude-$(basename "$PROJECT_DIR")" \
@@ -35,6 +42,7 @@ exec docker run -it --rm \
   --tmpfs /home/node/.claude/projects:uid=1000,gid=1000 \
   -v "$HOME/.claude/projects/$PROJECT_SLUG":/home/node/.claude/projects/$PROJECT_SLUG \
   -v "$HOME/.claude.json":/home/node/.claude.json \
+  $HOST_TOOL_MOUNTS \
   -e TERM=xterm-256color \
   -w "$PROJECT_DIR" \
   "$IMAGE_NAME" \
