@@ -162,6 +162,18 @@ Daemon mode also:
 - Mounts `$HOME/.ssh:/home/node/.ssh:ro`, so the container inherits the host's `~/.ssh/config` alias → key mapping. Use aliases in repo URLs (e.g. `git@github-foo:org/repo.git`).
 - Adds `--add-host=host.docker.internal:host-gateway`, so `http://host.docker.internal:$CLAUDE_MCP_PORT/mcp` reaches an MCP server running on the host.
 - Does **not** set git identity. The dispatcher injects it per-dispatch: `docker exec -e GIT_AUTHOR_NAME=… -e GIT_COMMITTER_NAME=… -e GIT_AUTHOR_EMAIL=… -e GIT_COMMITTER_EMAIL=… claude-worker claude "…"`.
+- In link mode, symlinks `/opt/venv → $HOST_VENV` inside the container after startup, so the image's baked `PATH=/opt/venv/bin:$PATH` resolves to the working interpreter. Runs a fail-loud preflight (`python3 -c "assert sys.prefix.startswith($HOST_VENV)"`) and exits 1 with an actionable error if the environment is broken — a silent Python-env regression once cost ~1–2 h per dispatched run in filesystem archaeology (see `evolvix#710`/`#742`).
+- Seeds `hasTrustDialogAccepted: true` in the shared `~/.claude.json` for every project's in-container path (`/workspace/projects/<name>`), so dispatched agents get their `.claude/settings.local.json` permission grants. Skipped silently if `jq` isn't installed on the host.
+
+### Overriding the Python environment (`HOST_VENV`)
+
+In link mode, the script auto-detects the active host venv via `python3 -c "import sys; print(sys.prefix if sys.prefix != sys.base_prefix else '')"`. For an atypical layout (a venv at a non-standard path, or wanting to force a specific one), export before `--daemon`:
+
+```sh
+HOST_VENV=/opt/my-project-venv ./claude-docker.sh --daemon
+```
+
+The value is same-path bind-mounted read-only into the container. Machine-specific overrides belong in a gitignored `env.local.sh` or `~/.claude/docker.env` rather than the tracked repo. The daemon's preflight will refuse to start if the resulting `python3` doesn't resolve inside `$HOST_VENV`.
 
 Lifecycle:
 

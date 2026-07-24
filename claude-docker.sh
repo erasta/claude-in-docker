@@ -482,6 +482,28 @@ if [ "$DAEMON_MODE" = true ]; then
 fi
 
 if [ "$DAEMON_MODE" = true ]; then
+  # Seed hasTrustDialogAccepted for each project's IN-CONTAINER worktree path
+  # so dispatched agents get their .claude/settings.local.json permission grants
+  # (currently ~20 silently dropped per run with a "workspace has not been
+  # trusted" warning). The container's /workspace/projects/<name> is a distinct
+  # path from any host directory, so the entry doesn't shadow user config.
+  # Skipped silently if jq or ~/.claude.json is absent (best-effort).
+  if command -v jq >/dev/null 2>&1 && [ -f "$HOME/.claude.json" ] && [ -d "$CLAUDE_PROJECTS_DIR" ]; then
+    for _proj in "$CLAUDE_PROJECTS_DIR"/*/; do
+      [ -d "$_proj" ] || continue
+      _pname="$(basename "$_proj")"
+      _cpath="/workspace/projects/$_pname"
+      _tmp="$(mktemp)"
+      if jq --arg p "$_cpath" '.projects[$p].hasTrustDialogAccepted = true' \
+             "$HOME/.claude.json" > "$_tmp" 2>/dev/null; then
+        mv "$_tmp" "$HOME/.claude.json"
+      else
+        rm -f "$_tmp"
+        echo "WARN: could not seed hasTrustDialogAccepted for $_cpath" >&2
+      fi
+    done
+  fi
+
   echo "==> Starting persistent Claude worker (container: $CLAUDE_CONTAINER_NAME)..."
   docker run -d \
     --name "$CLAUDE_CONTAINER_NAME" \
