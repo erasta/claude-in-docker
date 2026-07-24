@@ -523,6 +523,32 @@ if [ "$DAEMON_MODE" = true ]; then
     chown -R node:node /workspace >/dev/null 2>&1 || \
     echo "WARN: could not chown /workspace to node:node in $CLAUDE_CONTAINER_NAME" >&2
 
+  # In link mode, point /opt/venv at the mounted host venv so the image's
+  # baked PATH (/opt/venv/bin first) resolves to the working interpreter.
+  # Before this: the 2026-07-18 base/overlay split (commit 6a55d98) dropped
+  # python3 from Dockerfile.base; link mode mounted HOST_VENV at its own
+  # absolute path but nothing extended PATH there, so `python3` fell through
+  # to the Debian minimal `/usr/bin/python3` with no packages. Dispatched
+  # runs then spent large chunks of their budget doing filesystem archaeology
+  # to rediscover the working interpreter (evolvix#710, #742).
+  if [ "$ENV_MODE" = "link" ] && [ -n "$HOST_VENV" ]; then
+    docker exec -u 0 "$CLAUDE_CONTAINER_NAME" \
+      ln -sfn "$HOST_VENV" /opt/venv >/dev/null 2>&1 || \
+      echo "WARN: could not link /opt/venv -> $HOST_VENV in $CLAUDE_CONTAINER_NAME" >&2
+    # Fail-loud preflight: prove `python3` in the container can now import a
+    # basic scientific package. A silent failure here is what let this bug
+    # go unnoticed for six days; an assertion at start turns it into an
+    # immediate, actionable error.
+    if ! docker exec "$CLAUDE_CONTAINER_NAME" \
+         python3 -c "import sys; assert sys.prefix.startswith('$HOST_VENV'), sys.prefix" \
+         >/dev/null 2>&1; then
+      echo "ERROR: python3 in $CLAUDE_CONTAINER_NAME does not resolve to $HOST_VENV;" >&2
+      echo "       dispatched runs will burn tokens re-discovering the interpreter." >&2
+      echo "       Check PATH (expected /opt/venv/bin first) and the /opt/venv symlink." >&2
+      exit 1
+    fi
+  fi
+
   echo "Claude worker started (container: $CLAUDE_CONTAINER_NAME)"
   echo "  Projects:  /workspace/projects  (host: $CLAUDE_PROJECTS_DIR)"
   echo "  Dispatch:  /workspace/dispatch  (host: $CLAUDE_DISPATCH_DIR)"
