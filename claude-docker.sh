@@ -557,16 +557,23 @@ if [ "$DAEMON_MODE" = true ]; then
     docker exec -u 0 "$CLAUDE_CONTAINER_NAME" \
       ln -sfn "$HOST_VENV" /opt/venv >/dev/null 2>&1 || \
       echo "WARN: could not link /opt/venv -> $HOST_VENV in $CLAUDE_CONTAINER_NAME" >&2
-    # Fail-loud preflight: prove `python3` in the container can now import a
-    # basic scientific package. A silent failure here is what let this bug
-    # go unnoticed for six days; an assertion at start turns it into an
-    # immediate, actionable error.
+    # Fail-loud preflight: prove `python3` in the container can actually import
+    # a basic package. A silent failure here is what let this bug go unnoticed
+    # for six days; an assertion at start turns it into an immediate error.
+    #
+    # Use a FUNCTIONAL check (`import numpy`) rather than a path check —
+    # sys.prefix returns "/opt/venv" (the symlink itself, not the resolved
+    # target), so the earlier `sys.prefix.startswith($HOST_VENV)` assertion
+    # failed even when the environment was working. What actually matters
+    # is that packages resolve; if a real ImportError fires, we're broken.
     if ! docker exec "$CLAUDE_CONTAINER_NAME" \
-         python3 -c "import sys; assert sys.prefix.startswith('$HOST_VENV'), sys.prefix" \
+         python3 -c "import numpy, pytest" \
          >/dev/null 2>&1; then
-      echo "ERROR: python3 in $CLAUDE_CONTAINER_NAME does not resolve to $HOST_VENV;" >&2
+      echo "ERROR: python3 in $CLAUDE_CONTAINER_NAME cannot import numpy/pytest;" >&2
       echo "       dispatched runs will burn tokens re-discovering the interpreter." >&2
-      echo "       Check PATH (expected /opt/venv/bin first) and the /opt/venv symlink." >&2
+      echo "       Check PATH (expected /opt/venv/bin first), the /opt/venv" >&2
+      echo "       symlink, and that HOST_VENV=$HOST_VENV actually has these" >&2
+      echo "       packages installed." >&2
       exit 1
     fi
   fi
