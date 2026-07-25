@@ -505,9 +505,15 @@ if [ "$DAEMON_MODE" = true ]; then
   fi
 
   echo "==> Starting persistent Claude worker (container: $CLAUDE_CONTAINER_NAME)..."
+  # --init installs tini (docker's built-in) as PID 1 to reap orphaned child
+  # processes (evolvix#764). Without it, every git subprocess claude spawns
+  # can become a defunct zombie reparented to `tail -f /dev/null` (which
+  # doesn't reap), and the worker eventually crashes at startup on the next
+  # dispatch (evolvix#776). Cheap: tini adds ~10KB, no runtime overhead.
   docker run -d \
     --name "$CLAUDE_CONTAINER_NAME" \
     --restart unless-stopped \
+    --init \
     --add-host=host.docker.internal:host-gateway \
     $GPU_FLAG \
     -v "$HOME/.claude":/home/node/.claude \
