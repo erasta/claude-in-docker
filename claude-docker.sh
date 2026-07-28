@@ -604,11 +604,11 @@ fi
 if [ "$NAME_EXPLICIT" = true ]; then
   INTERACTIVE_NAME="$CLAUDE_CONTAINER_NAME"
 else
-  # evolvix#906: use the `claude-worker-<name>` convention the daemon
-  # workers use (matches `evolvix up` and the `name=claude-worker-` filter
-  # that `make stop` relies on) so an interactive container can't linger
-  # with a non-conforming name and shadow the designated worker.
-  INTERACTIVE_NAME="claude-worker-$(basename "$PROJECT_DIR")"
+  # Keep the `claude-worker-*` namespace reserved for dispatcher workers
+  # (that's what `evolvix up` and `make stop`'s name=claude-worker- filter
+  # target). Interactive containers get `claude-<basename>` so they can't
+  # shadow a designated worker.
+  INTERACTIVE_NAME="claude-$(basename "$PROJECT_DIR")"
 fi
 
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
