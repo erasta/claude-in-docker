@@ -94,11 +94,13 @@ Persistent worker mode (for MCP dispatch):
   --daemon              Start a persistent worker container in the background.
                         The dispatcher drives it via `docker exec`. Mounts
                         $CLAUDE_PROJECTS_DIR (default ~/claude-projects) at
-                        /workspace/projects and $CLAUDE_DISPATCH_DIR (default
-                        ~/claude-dispatch) at /workspace/dispatch. Mounts
-                        $HOME/.ssh read-only so the container inherits your
-                        host's key-alias mapping. Container is named
-                        $CLAUDE_CONTAINER_NAME (default claude-worker).
+                        /workspace/projects. Mounts $HOME/.ssh read-only so
+                        the container inherits your host's key-alias mapping.
+                        Container is named $CLAUDE_CONTAINER_NAME (default
+                        claude-worker). The /workspace/dispatch mount is
+                        NOT baked (evolvix#906) — the caller declares it via
+                        `-v <host_dir>:/workspace/dispatch` so host source
+                        and container target can differ (docker-out-of-docker).
                         Settings can also be placed in ~/.claude/docker.env
                         — generate a template with `make docker-config`.
   --stop                Stop the persistent worker.
@@ -474,11 +476,19 @@ if [ "$DAEMON_MODE" = true ] && [ -d "$HOME/.ssh" ]; then
   SSH_MOUNTS="-v $HOME/.ssh:/home/node/.ssh:ro"
 fi
 
-# Persistent project clones + per-dispatch worktrees. Daemon-only so the
-# interactive mode is unchanged.
+# Persistent project clones. Daemon-only so the interactive mode is unchanged.
+#
+# NOTE (evolvix#906): the /workspace/dispatch mount is NOT baked here anymore.
+# Evolvix's Stage-2 host gate runs `sh <container_path>` on the HOST, which only
+# works when the caller can declare BOTH sides of the mount (host source and
+# container target may differ under docker-out-of-docker). Baking a default
+# source==target here collided with the caller's explicit `-v` (docker
+# last-wins, order-dependent). The caller (evolvix ensure_worker /
+# `evolvix up`) now passes `-v <host_dir>:/workspace/dispatch` via -v
+# passthrough (EXTRA_VOLUME_FLAGS below) as the single source of truth.
 DISPATCH_MOUNTS=""
 if [ "$DAEMON_MODE" = true ]; then
-  DISPATCH_MOUNTS="-v $CLAUDE_PROJECTS_DIR:/workspace/projects -v $CLAUDE_DISPATCH_DIR:/workspace/dispatch"
+  DISPATCH_MOUNTS="-v $CLAUDE_PROJECTS_DIR:/workspace/projects"
 fi
 
 if [ "$DAEMON_MODE" = true ]; then
@@ -594,7 +604,11 @@ fi
 if [ "$NAME_EXPLICIT" = true ]; then
   INTERACTIVE_NAME="$CLAUDE_CONTAINER_NAME"
 else
-  INTERACTIVE_NAME="claude-$(basename "$PROJECT_DIR")"
+  # evolvix#906: use the `claude-worker-<name>` convention the daemon
+  # workers use (matches `evolvix up` and the `name=claude-worker-` filter
+  # that `make stop` relies on) so an interactive container can't linger
+  # with a non-conforming name and shadow the designated worker.
+  INTERACTIVE_NAME="claude-worker-$(basename "$PROJECT_DIR")"
 fi
 
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
