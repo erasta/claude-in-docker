@@ -9,125 +9,305 @@ if [ -f "$HOME/.claude/docker.env" ]; then
   . "$HOME/.claude/docker.env"
 fi
 
-# ── Capability contract (evolvix#931) ────────────────────────────────
-# The launcher runs in one of two modes:
-#   * contract  — read capabilities.conf, validate, apply exactly what it says
-#   * --auto    — auto-detect GPU / network / PYTHONPATH exactly as before
-# Fail-closed: neither mode selected + no config present → error.
-# See README ("Capability contract").
+# ── Capability contract (evolvix#931, reshaped by evolvix#935) ────────
+# Two modes, mutually exclusive:
+#   * contract (default) — read capabilities.conf, validate, apply exactly
+#                          what it says. Two hosts, same file → equivalent
+#                          containers.
+#   * --auto             — pre-#931 behaviour (auto-detect GPU, --network
+#                          host interactive, host tool passthrough for gh,
+#                          $HOME/.ssh mount, cuda if present,
+#                          set-environment-vars.conf, readonly-mounts.conf).
+# Fail-closed: neither + no config → error. Both → error.
+#
+# v1 rewrite (#935): the launcher now has no built-in knowledge of gh /
+# ssh / cuda — everything the container needs is declared under
+# `resources:`. `readonly-mounts.conf` and `set-environment-vars.conf`
+# are retired in contract mode (still honoured in --auto).
+#
+# Format (YAML subset, parsed by an embedded python3):
+#   version: 1
+#   capabilities:
+#     gpu: nvidia            # nvidia | dri | kfd | none
+#     network_mode: host     # host | bridge | none
+#     python_mode: link      # link | copy
+#   resources:
+#     github:
+#       cli: gh                                        # PATH-check on host
+#       mounts:
+#         - ~/.config/gh:/home/node/.config/gh:ro
+#       env:                                           # names, never values
+#         - GH_TOKEN
+#         - GITHUB_TOKEN
+#     ssh:
+#       mounts:
+#         - ${SSH_AUTH_SOCK}:/ssh-agent
+#       env_set:                                       # non-secret literals
+#         SSH_AUTH_SOCK: /ssh-agent
 
 CAP_SUPPORTED_VERSIONS="1"
-CAP_KNOWN_KEYS=" version gpu network_mode pythonpath_forward latex python_sci ollama "
-
-CAP_DEFAULT_gpu="none"
-CAP_DEFAULT_network_mode="bridge"
-CAP_DEFAULT_pythonpath_forward="false"
-CAP_DEFAULT_latex="false"
-CAP_DEFAULT_python_sci="false"
-CAP_DEFAULT_ollama="false"
-
-CAP_ALLOWED_gpu=" none nvidia nvidia-runtime nvidia-passthrough amd intel "
-CAP_ALLOWED_network_mode=" host bridge none "
-CAP_ALLOWED_pythonpath_forward=" true false "
-CAP_ALLOWED_latex=" true false "
-CAP_ALLOWED_python_sci=" true false "
-CAP_ALLOWED_ollama=" true false "
-
-# capabilities_validate_value KEY VALUE
-# Exit 2 with an error if VALUE is not in CAP_ALLOWED_<KEY>. No-op when the
-# key has no allow-list (all keys currently do; keeps the helper generic).
-capabilities_validate_value() {
-  local key="$1"
-  local val="$2"
-  local allowed_var="CAP_ALLOWED_${key}"
-  local allowed="${!allowed_var:-}"
-  [ -z "$allowed" ] && return 0
-  if [[ ! " $allowed " == *" $val "* ]]; then
-    echo "ERROR: capability '$key' has invalid value '$val' (allowed:$allowed)" >&2
-    exit 2
-  fi
-}
 
 # capabilities_parse PATH
-# Reads the file at PATH, validates every line, and populates CAP_<key>
-# globals. A missing `version` is an error (never a default). An unknown
-# key is an error (never silent). An unsupported version is an error.
+# Invokes an embedded python3 parser that produces shell assignments the
+# caller sources. The parser handles:
+#   * missing `version` → error, never a default
+#   * unsupported `version` → error
+#   * unknown top-level key → error (never silent)
+#   * unknown key under `capabilities:` → error
+#   * invalid enum value → error
+#   * `~` / `${VAR}` expansion in mount paths
+#   * mount source not present on host → error at parse time
+#   * resource `cli:` not on host `PATH` → error at parse time
+# Output shell variables:
+#   CAP_gpu, CAP_network_mode, CAP_python_mode
+#   RES_NAMES (space-separated list of resource names, order-stable)
+#   For each name N:
+#     RES_N_cli          (may be empty)
+#     RES_N_mounts       (newline-separated host:container[:ro])
+#     RES_N_env_keys     (space-separated env-var names to forward)
+#     RES_N_env_set_keys (space-separated env_set keys)
+#     RES_N_env_set_<K>  (one variable per env_set key)
 capabilities_parse() {
   local path="$1"
-  local line key val version_seen=0
-  CAP_gpu="$CAP_DEFAULT_gpu"
-  CAP_network_mode="$CAP_DEFAULT_network_mode"
-  CAP_pythonpath_forward="$CAP_DEFAULT_pythonpath_forward"
-  CAP_latex="$CAP_DEFAULT_latex"
-  CAP_python_sci="$CAP_DEFAULT_python_sci"
-  CAP_ollama="$CAP_DEFAULT_ollama"
-  CAP_version=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [ -z "$line" ] && continue
-    if [[ ! "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*:[[:space:]]*(.+)$ ]]; then
-      echo "ERROR: $path: malformed line (expected 'key: value'): $line" >&2
-      exit 2
-    fi
-    key="${BASH_REMATCH[1]}"
-    val="${BASH_REMATCH[2]}"
-    val="${val#"${val%%[![:space:]]*}"}"
-    val="${val%"${val##*[![:space:]]}"}"
-    if [[ ! " $CAP_KNOWN_KEYS " == *" $key "* ]]; then
-      echo "ERROR: $path: unknown key '$key' (known:$CAP_KNOWN_KEYS)" >&2
-      exit 2
-    fi
-    if [ "$key" = "version" ]; then
-      if [[ ! " $CAP_SUPPORTED_VERSIONS " == *" $val "* ]]; then
-        echo "ERROR: $path: unsupported version '$val' (this launcher supports: $CAP_SUPPORTED_VERSIONS)" >&2
-        exit 2
-      fi
-      CAP_version="$val"
-      version_seen=1
-      continue
-    fi
-    capabilities_validate_value "$key" "$val"
-    printf -v "CAP_${key}" '%s' "$val"
-  done < "$path"
-  if [ "$version_seen" -eq 0 ]; then
-    echo "ERROR: $path: missing required 'version' key (must be one of: $CAP_SUPPORTED_VERSIONS)" >&2
+  local shell_output
+  if ! shell_output="$(python3 - "$path" <<'PYPARSE'
+import os, re, shlex, sys, shutil
+
+PATH = sys.argv[1]
+SUPPORTED = {"1"}
+CAP_KEYS = {"gpu", "network_mode", "python_mode"}
+CAP_ALLOWED = {
+    "gpu": {"nvidia", "dri", "kfd", "none"},
+    "network_mode": {"host", "bridge", "none"},
+    "python_mode": {"link", "copy"},
+}
+CAP_DEFAULTS = {"gpu": "none", "network_mode": "bridge", "python_mode": "link"}
+RES_KEYS = {"cli", "mounts", "env", "env_set"}
+TOP_KEYS = {"version", "capabilities", "resources"}
+
+def die(msg):
+    sys.stderr.write(f"ERROR: {PATH}: {msg}\n")
+    sys.exit(2)
+
+# Tiny indent-based YAML-subset parser. Supports:
+#   key: value
+#   key:
+#     nested:
+#       ...
+#   list:
+#     - item
+#     - item
+#   dict of scalars:
+#     KEY: value
+
+def parse(text):
+    lines = []
+    for raw in text.splitlines():
+        # strip trailing comments (only when '#' follows whitespace or is at col 0)
+        # but leave '#' inside quoted strings alone (we don't support quotes here)
+        stripped = raw.rstrip()
+        if not stripped or stripped.lstrip().startswith("#"):
+            continue
+        # find inline # after two spaces (yaml convention)
+        m = re.match(r"^(.*?)(\s{2,}#.*)?$", stripped)
+        stripped = m.group(1).rstrip() if m else stripped
+        if not stripped:
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if "\t" in raw[:indent]:
+            die(f"tab in indentation: {raw!r}")
+        lines.append((indent, stripped.lstrip()))
+    result, i = _parse_block(lines, 0, 0)
+    return result
+
+def _parse_block(lines, i, base_indent):
+    """Parse a block at base_indent. Returns (value, next_i).
+    Detects dict vs list from the first non-empty line at that indent."""
+    if i >= len(lines):
+        return None, i
+    indent, first = lines[i]
+    if indent < base_indent:
+        return None, i
+    if first.startswith("- "):
+        return _parse_list(lines, i, indent)
+    return _parse_dict(lines, i, indent)
+
+def _parse_dict(lines, i, my_indent):
+    out = {}
+    while i < len(lines):
+        indent, line = lines[i]
+        if indent < my_indent:
+            break
+        if indent > my_indent:
+            die(f"unexpected indent at line {line!r}")
+        if ":" not in line:
+            die(f"expected 'key: value' or 'key:', got: {line!r}")
+        k, sep, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        i += 1
+        if v == "":
+            # nested block
+            nested, i = _parse_block(lines, i, my_indent + 1) if i < len(lines) and lines[i][0] > my_indent else ({}, i)
+            # allow empty nested = {}
+            out[k] = nested if nested is not None else {}
+        else:
+            out[k] = v
+    return out, i
+
+def _parse_list(lines, i, my_indent):
+    out = []
+    while i < len(lines):
+        indent, line = lines[i]
+        if indent < my_indent or not line.startswith("- "):
+            break
+        if indent > my_indent:
+            die(f"unexpected list indent at {line!r}")
+        item = line[2:].strip()
+        out.append(item)
+        i += 1
+    return out, i
+
+try:
+    with open(PATH) as f:
+        text = f.read()
+except OSError as e:
+    die(f"cannot read: {e}")
+
+data = parse(text)
+if not isinstance(data, dict):
+    die("top-level must be a mapping")
+
+# Unknown top-level key?
+for k in data.keys():
+    if k not in TOP_KEYS:
+        die(f"unknown top-level key '{k}' (known: version, capabilities, resources)")
+
+# version — required, must be supported
+version = data.get("version")
+if version is None:
+    die(f"missing required 'version' key (supported: {sorted(SUPPORTED)})")
+version = str(version)
+if version not in SUPPORTED:
+    die(f"unsupported version '{version}' (this launcher supports: {sorted(SUPPORTED)})")
+
+# capabilities section
+caps = data.get("capabilities") or {}
+if not isinstance(caps, dict):
+    die("`capabilities:` must be a mapping")
+for k in caps.keys():
+    if k not in CAP_KEYS:
+        die(f"unknown key '{k}' under 'capabilities:' (known: {sorted(CAP_KEYS)})")
+resolved_caps = {}
+for k in CAP_KEYS:
+    v = caps.get(k, CAP_DEFAULTS[k])
+    if v not in CAP_ALLOWED[k]:
+        die(f"capabilities.{k}: invalid value '{v}' (allowed: {sorted(CAP_ALLOWED[k])})")
+    resolved_caps[k] = v
+
+# resources section
+resources = data.get("resources") or {}
+if not isinstance(resources, dict):
+    die("`resources:` must be a mapping")
+
+def expand(s):
+    return os.path.expanduser(os.path.expandvars(s))
+
+def emit_var(name, value):
+    print(f"{name}={shlex.quote(value)}")
+
+emit_var("CAP_gpu", resolved_caps["gpu"])
+emit_var("CAP_network_mode", resolved_caps["network_mode"])
+emit_var("CAP_python_mode", resolved_caps["python_mode"])
+
+resource_names = []
+for name, spec in resources.items():
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
+        die(f"invalid resource name '{name}' (must match [a-zA-Z_][a-zA-Z0-9_-]*)")
+    if not isinstance(spec, dict):
+        die(f"resource '{name}' must be a mapping")
+    for k in spec.keys():
+        if k not in RES_KEYS:
+            die(f"resource '{name}': unknown key '{k}' (known: {sorted(RES_KEYS)})")
+
+    cli = spec.get("cli", "")
+    mounts_raw = spec.get("mounts", [])
+    if isinstance(mounts_raw, dict):
+        die(f"resource '{name}': `mounts:` must be a list, not a mapping")
+    if not isinstance(mounts_raw, list):
+        mounts_raw = [mounts_raw] if mounts_raw else []
+
+    env_raw = spec.get("env", [])
+    if isinstance(env_raw, dict):
+        die(f"resource '{name}': `env:` must be a list of names, not a mapping (use env_set for literals)")
+    if not isinstance(env_raw, list):
+        env_raw = [env_raw] if env_raw else []
+
+    env_set_raw = spec.get("env_set", {})
+    if isinstance(env_set_raw, list):
+        die(f"resource '{name}': `env_set:` must be a mapping, not a list")
+    if not isinstance(env_set_raw, dict):
+        die(f"resource '{name}': `env_set:` must be a mapping of key: literal")
+
+    # env: names never carry values
+    for v in env_raw:
+        if "=" in str(v):
+            die(f"resource '{name}': `env` items are NAMES only (found '{v}' — literals go under env_set)")
+
+    # cli preconditon check — host PATH
+    if cli:
+        if shutil.which(cli) is None:
+            die(f"resource '{name}': cli '{cli}' not found on host PATH (install it or drop the resource)")
+
+    # mount validation — expand + check source exists
+    expanded_mounts = []
+    for m in mounts_raw:
+        m = str(m)
+        parts = m.split(":")
+        if len(parts) < 2 or len(parts) > 3:
+            die(f"resource '{name}': mount '{m}' must be host:container[:ro]")
+        host = expand(parts[0])
+        container = parts[1]
+        mode = parts[2] if len(parts) == 3 else ""
+        if mode and mode not in ("ro", "rw"):
+            die(f"resource '{name}': mount '{m}': mode must be ro|rw|(empty), got '{mode}'")
+        if not os.path.exists(host):
+            die(f"resource '{name}': mount source not found on host: {host}")
+        rendered = f"{host}:{container}" + (f":{mode}" if mode else "")
+        expanded_mounts.append(rendered)
+
+    resource_names.append(name)
+    n = name.replace("-", "_")
+    emit_var(f"RES_{n}_cli", cli)
+    emit_var(f"RES_{n}_mounts", "\n".join(expanded_mounts))
+    emit_var(f"RES_{n}_env_keys", " ".join(str(x) for x in env_raw))
+    emit_var(f"RES_{n}_env_set_keys", " ".join(env_set_raw.keys()))
+    for k, v in env_set_raw.items():
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+            die(f"resource '{name}': env_set key '{k}' is not a valid env name")
+        emit_var(f"RES_{n}_env_set_{k}", str(v))
+
+emit_var("RES_NAMES", " ".join(resource_names))
+PYPARSE
+  )"; then
     exit 2
   fi
+  eval "$shell_output"
 }
 
 # capabilities_apply_gpu
-# Sets GPU_FLAG per CAP_gpu and errors if the host lacks the requested
-# hardware. `none` produces an empty GPU_FLAG regardless of host.
+# Sets GPU_FLAG per CAP_gpu, errors if the host cannot satisfy it.
+# Values (v1 rewrite): nvidia | dri | kfd | none.
+#   nvidia — prefers the container runtime, falls back to /dev/nvidia* passthrough.
+#   dri    — /dev/dri/renderD* (AMD or Intel).
+#   kfd    — /dev/kfd (+ /dev/dri if present). ROCm.
+#   none   — no GPU, regardless of host.
 capabilities_apply_gpu() {
   local flags=""
   case "$CAP_gpu" in
     none)
       GPU_FLAG=""
       echo "==> GPU: disabled (capability: none)"
-      ;;
-    nvidia-runtime)
-      if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
-        GPU_FLAG="--gpus all"
-        echo "==> GPU: NVIDIA container runtime (capability: nvidia-runtime)"
-      else
-        echo "ERROR: capability 'gpu: nvidia-runtime' requested but nvidia container runtime is not registered with Docker." >&2
-        echo "       Install nvidia-container-toolkit: $(dirname "${BASH_SOURCE[0]}")/setup-gpu.sh" >&2
-        exit 2
-      fi
-      ;;
-    nvidia-passthrough)
-      for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
-        [ -c "$dev" ] && flags="$flags --device $dev"
-      done
-      if [ -n "$flags" ]; then
-        GPU_FLAG="$flags"
-        echo "==> GPU: NVIDIA device passthrough (capability: nvidia-passthrough)"
-      else
-        echo "ERROR: capability 'gpu: nvidia-passthrough' requested but no /dev/nvidia* devices found." >&2
-        exit 2
-      fi
       ;;
     nvidia)
       if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
@@ -146,30 +326,26 @@ capabilities_apply_gpu() {
         fi
       fi
       ;;
-    amd)
+    dri)
       for dev in /dev/dri/renderD*; do
         [ -c "$dev" ] && flags="$flags --device $dev"
       done
-      [ -c /dev/kfd ] && flags="$flags --device /dev/kfd"
       if [ -n "$flags" ]; then
         GPU_FLAG="$flags"
-        echo "==> GPU: AMD (capability: amd)"
+        echo "==> GPU: DRI render nodes (capability: dri)"
       else
-        echo "ERROR: capability 'gpu: amd' requested but no /dev/dri/renderD* or /dev/kfd found." >&2
+        echo "ERROR: capability 'gpu: dri' requested but no /dev/dri/renderD* found." >&2
         exit 2
       fi
       ;;
-    intel)
+    kfd)
+      [ -c /dev/kfd ] || { echo "ERROR: capability 'gpu: kfd' requested but /dev/kfd not present." >&2; exit 2; }
+      flags="--device /dev/kfd"
       for dev in /dev/dri/renderD*; do
         [ -c "$dev" ] && flags="$flags --device $dev"
       done
-      if [ -n "$flags" ]; then
-        GPU_FLAG="$flags"
-        echo "==> GPU: Intel (capability: intel)"
-      else
-        echo "ERROR: capability 'gpu: intel' requested but no /dev/dri/renderD* found." >&2
-        exit 2
-      fi
+      GPU_FLAG="$flags"
+      echo "==> GPU: AMD ROCm (capability: kfd)"
       ;;
   esac
 }
@@ -187,54 +363,81 @@ capabilities_apply_network() {
   echo "==> Network: $CAP_network_mode (capability)"
 }
 
-# capabilities_check_overlay CAP LABEL
-# Errors if CAP_<cap> is true but the image lacks LABEL=1.
-capabilities_check_overlay() {
-  local cap="$1"
-  local label_name="$2"
-  local var="CAP_${cap}"
-  local requested="${!var}"
-  [ "$requested" = "true" ] || return 0
-  local val
-  val="$(docker image inspect "$IMAGE_NAME" --format "{{ index .Config.Labels \"$label_name\" }}" 2>/dev/null || true)"
-  if [ "$val" != "1" ]; then
-    local make_target
-    case "$cap" in
-      latex)      make_target="make docker-add-latex" ;;
-      python_sci) make_target="make docker-add-python-sci" ;;
-      ollama)     make_target="make docker-add-ollama" ;;
-    esac
-    echo "ERROR: capability '$cap: true' requested but image '$IMAGE_NAME' lacks label '$label_name=1'." >&2
-    echo "       Build the overlay first: $make_target" >&2
-    exit 2
-  fi
-  echo "==> Overlay: $cap present (image label $label_name=1)"
+# capabilities_apply_resources
+# Populates RESOURCE_MOUNTS (space-separated -v flags) and RESOURCE_ENV_FLAGS
+# (space-separated -e flags: name-only forwards and key=value env_set writes).
+# The parser already validated cli existence + mount sources; this just emits
+# docker-cli arguments in a stable order.
+#
+# Note: env names go in as `-e NAME` (no value) — docker resolves the value
+# from the launcher's environment at start time. env_set literals go in as
+# `-e NAME=LITERAL`. Neither ever writes a value into capabilities.conf
+# (README: `env:` carries names only; never write secrets to the file).
+capabilities_apply_resources() {
+  RESOURCE_MOUNTS=""
+  RESOURCE_ENV_FLAGS=""
+  RESOURCE_ENV_SET_LITERALS=()
+  local name n mounts_var env_keys_var env_set_keys_var cli_var
+  local mounts env_keys env_set_keys cli
+  for name in $RES_NAMES; do
+    n="${name//-/_}"
+    cli_var="RES_${n}_cli";                cli="${!cli_var:-}"
+    mounts_var="RES_${n}_mounts";          mounts="${!mounts_var:-}"
+    env_keys_var="RES_${n}_env_keys";      env_keys="${!env_keys_var:-}"
+    env_set_keys_var="RES_${n}_env_set_keys"; env_set_keys="${!env_set_keys_var:-}"
+    echo "==> Resource: $name${cli:+ (cli: $cli)}"
+    local m
+    if [ -n "$mounts" ]; then
+      while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $m"
+        echo "    mount  $m"
+      done <<< "$mounts"
+    fi
+    local k
+    for k in $env_keys; do
+      RESOURCE_ENV_FLAGS="$RESOURCE_ENV_FLAGS -e $k"
+      echo "    env    $k (forwarded from launcher env)"
+    done
+    for k in $env_set_keys; do
+      local vv_var="RES_${n}_env_set_${k}"
+      local vv="${!vv_var:-}"
+      RESOURCE_ENV_SET_LITERALS+=("-e" "$k=$vv")
+      echo "    env_set $k=$vv"
+    done
+  done
 }
 
 # capabilities_generate — writes a capabilities.conf to stdout or --output PATH.
-# Non-interactive by default; per-key flags supply values. `--interactive`
-# prompts for each key. Both paths produce byte-identical output for the
-# same effective inputs (that IS the contract, evolvix#931).
+# Flags:
+#   --output FILE            Write to FILE instead of stdout.
+#   --interactive            Prompt for capabilities: values (not resources).
+#   --gpu=VAL                capabilities.gpu
+#   --network-mode=VAL       capabilities.network_mode
+#   --python-mode=VAL        capabilities.python_mode
+#   --resource NAME:cli=CLI,mount=H:C[:ro],mount=H2:C2,env=KEY,env=KEY2,env_set=K=V
+#                            (repeatable) One resource declaration.
+# Same effective inputs → byte-identical output. Downstream generators
+# (Evolvix `project install`, #932) must produce files this launcher accepts;
+# if a downstream generator disagrees, the launcher is correct.
 capabilities_generate() {
   local output_file="" interactive=false
-  local gen_gpu="none" gen_network="bridge" gen_pypath="false"
-  local gen_latex="false" gen_python_sci="false" gen_ollama="false"
+  local gen_gpu="none" gen_network="bridge" gen_python="link"
+  local resource_specs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --output)
-        if [ -z "${2:-}" ]; then
-          echo "ERROR: --output requires a value" >&2
-          exit 2
-        fi
+        [ -z "${2:-}" ] && { echo "ERROR: --output requires a value" >&2; exit 2; }
         output_file="$2"; shift 2
         ;;
       --interactive) interactive=true; shift ;;
-      --gpu=*)                gen_gpu="${1#*=}"; shift ;;
-      --network-mode=*)       gen_network="${1#*=}"; shift ;;
-      --pythonpath-forward=*) gen_pypath="${1#*=}"; shift ;;
-      --latex)                gen_latex="true"; shift ;;
-      --python-sci)           gen_python_sci="true"; shift ;;
-      --ollama)               gen_ollama="true"; shift ;;
+      --gpu=*)          gen_gpu="${1#*=}"; shift ;;
+      --network-mode=*) gen_network="${1#*=}"; shift ;;
+      --python-mode=*)  gen_python="${1#*=}"; shift ;;
+      --resource)
+        [ -z "${2:-}" ] && { echo "ERROR: --resource requires a value" >&2; exit 2; }
+        resource_specs+=("$2"); shift 2
+        ;;
       *)
         echo "ERROR: --generate-capabilities: unknown argument: $1" >&2
         exit 2
@@ -244,43 +447,109 @@ capabilities_generate() {
 
   if [ "$interactive" = true ]; then
     local ans
-    printf "gpu [%s] (%s): " "$gen_gpu" "$(echo "$CAP_ALLOWED_gpu" | sed 's/^ *//;s/ *$//;s/ /|/g')" >&2
+    printf "gpu [%s] (nvidia|dri|kfd|none): " "$gen_gpu" >&2
     read -r ans; [ -n "$ans" ] && gen_gpu="$ans"
-    printf "network_mode [%s] (%s): " "$gen_network" "$(echo "$CAP_ALLOWED_network_mode" | sed 's/^ *//;s/ *$//;s/ /|/g')" >&2
+    printf "network_mode [%s] (host|bridge|none): " "$gen_network" >&2
     read -r ans; [ -n "$ans" ] && gen_network="$ans"
-    printf "pythonpath_forward [%s] (true|false): " "$gen_pypath" >&2
-    read -r ans; [ -n "$ans" ] && gen_pypath="$ans"
-    printf "latex [%s] (true|false): " "$gen_latex" >&2
-    read -r ans; [ -n "$ans" ] && gen_latex="$ans"
-    printf "python_sci [%s] (true|false): " "$gen_python_sci" >&2
-    read -r ans; [ -n "$ans" ] && gen_python_sci="$ans"
-    printf "ollama [%s] (true|false): " "$gen_ollama" >&2
-    read -r ans; [ -n "$ans" ] && gen_ollama="$ans"
+    printf "python_mode [%s] (link|copy): " "$gen_python" >&2
+    read -r ans; [ -n "$ans" ] && gen_python="$ans"
   fi
 
-  capabilities_validate_value gpu                "$gen_gpu"
-  capabilities_validate_value network_mode       "$gen_network"
-  capabilities_validate_value pythonpath_forward "$gen_pypath"
-  capabilities_validate_value latex              "$gen_latex"
-  capabilities_validate_value python_sci         "$gen_python_sci"
-  capabilities_validate_value ollama             "$gen_ollama"
+  # Validate capabilities values against the parser's enum.
+  case "$gen_gpu"     in nvidia|dri|kfd|none) ;; *) echo "ERROR: --gpu: invalid value '$gen_gpu' (allowed: nvidia|dri|kfd|none)" >&2; exit 2 ;; esac
+  case "$gen_network" in host|bridge|none)   ;; *) echo "ERROR: --network-mode: invalid value '$gen_network' (allowed: host|bridge|none)" >&2; exit 2 ;; esac
+  case "$gen_python"  in link|copy)          ;; *) echo "ERROR: --python-mode: invalid value '$gen_python' (allowed: link|copy)" >&2; exit 2 ;; esac
 
-  local content
-  content="# capabilities.conf — see README (\"Capability contract\").
-# Generated by: claude-docker.sh --generate-capabilities
-version: 1
-gpu: $gen_gpu
-network_mode: $gen_network
-pythonpath_forward: $gen_pypath
-latex: $gen_latex
-python_sci: $gen_python_sci
-ollama: $gen_ollama"
+  # Emit via python for deterministic ordering + escaping.
+  local generated
+  if ! generated="$(python3 - "$gen_gpu" "$gen_network" "$gen_python" "${resource_specs[@]}" <<'PYGEN'
+import sys, re
+
+gpu, net, pymode = sys.argv[1], sys.argv[2], sys.argv[3]
+resource_specs = sys.argv[4:]
+
+def die(m):
+    sys.stderr.write(f"ERROR: --generate-capabilities: {m}\n")
+    sys.exit(2)
+
+# Parse: NAME:cli=CLI,mount=H:C[:ro],mount=H2:C2,env=KEY,env_set=K=V
+resources = []
+for spec in resource_specs:
+    if ":" not in spec:
+        die(f"--resource '{spec}' — missing NAME: prefix")
+    name, _, body = spec.partition(":")
+    name = name.strip()
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
+        die(f"--resource '{spec}' — invalid name '{name}'")
+    cli = ""
+    mounts = []
+    envs = []
+    env_set = []
+    # Fields comma-separated; a mount value may contain colons but not commas
+    # (paths with commas are not supported — file an issue if you need this).
+    for field in body.split(","):
+        field = field.strip()
+        if not field:
+            continue
+        if "=" not in field:
+            die(f"--resource '{spec}' — field '{field}' must be key=value")
+        k, _, v = field.partition("=")
+        k = k.strip(); v = v.strip()
+        if k == "cli":
+            cli = v
+        elif k == "mount":
+            mounts.append(v)
+        elif k == "env":
+            if "=" in v:
+                die(f"--resource '{spec}' — env values are NAMES only (found '{v}')")
+            envs.append(v)
+        elif k == "env_set":
+            if "=" not in v:
+                die(f"--resource '{spec}' — env_set needs K=V (got '{v}')")
+            env_set.append(v)
+        else:
+            die(f"--resource '{spec}' — unknown field '{k}' (allowed: cli, mount, env, env_set)")
+    resources.append((name, cli, mounts, envs, env_set))
+
+lines = [
+    "# capabilities.conf — see README (\"Capability contract\").",
+    "# Generated by: claude-docker.sh --generate-capabilities",
+    "version: 1",
+    "capabilities:",
+    f"  gpu: {gpu}",
+    f"  network_mode: {net}",
+    f"  python_mode: {pymode}",
+]
+if resources:
+    lines.append("resources:")
+    for name, cli, mounts, envs, env_set in resources:
+        lines.append(f"  {name}:")
+        if cli:
+            lines.append(f"    cli: {cli}")
+        if mounts:
+            lines.append("    mounts:")
+            for m in mounts:
+                lines.append(f"      - {m}")
+        if envs:
+            lines.append("    env:")
+            for e in envs:
+                lines.append(f"      - {e}")
+        if env_set:
+            lines.append("    env_set:")
+            for kv in env_set:
+                k, _, v = kv.partition("=")
+                lines.append(f"      {k}: {v}")
+print("\n".join(lines))
+PYGEN
+  )"; then
+    exit 2
+  fi
 
   if [ -n "$output_file" ]; then
-    printf '%s\n' "$content" > "$output_file"
+    printf '%s\n' "$generated" > "$output_file"
     echo "Wrote $output_file" >&2
   else
-    printf '%s\n' "$content"
+    printf '%s\n' "$generated"
   fi
 }
 
@@ -306,6 +575,11 @@ EXTRA_VOLUME_FLAGS=()
 AUTO_MODE=false
 CAPABILITIES_FILE=""
 CAPABILITIES_FILE_EXPLICIT=false
+# Initialized here so --auto (which never calls capabilities_apply_resources)
+# still expands them safely in the docker run arg list.
+RESOURCE_MOUNTS=""
+RESOURCE_ENV_FLAGS=""
+RESOURCE_ENV_SET_LITERALS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --auto)               AUTO_MODE=true; shift ;;
@@ -368,42 +642,59 @@ Usage: claude-docker.sh [OPTIONS]
 
 Run Claude Code in a Docker container with Python environment support.
 
-Capability contract (evolvix#931):
-  Since #931 the launcher runs in one of two mutually exclusive modes.
+Capability contract (evolvix#931, reshaped by #935):
+  The launcher runs in one of two mutually exclusive modes.
   --stop and --status are unaffected.
 
-  --auto                Auto-detect GPU / network / PYTHONPATH from the host —
-                        the pre-#931 behaviour. Deterministic across hosts is
-                        NOT guaranteed. Use for one-off runs or during migration.
+  --auto                Pre-#931 behaviour: auto-detect GPU, --network host
+                        interactive, mount host gh + ~/.ssh (daemon) + CUDA,
+                        read set-environment-vars.conf / readonly-mounts.conf.
+                        Fast for one-off runs; NOT deterministic across hosts.
   (default)             Contract mode. Reads capabilities.conf in the current
-                        directory (override with --capabilities-file). The file
-                        MUST declare `version:` and every capability it uses
-                        (unknown keys → error, unsupported version → error,
-                        missing version → error, requested-but-unavailable
-                        capability → error naming what's missing).
+                        directory (override with --capabilities-file).
+                        Nothing is assumed — the launcher has NO built-in
+                        knowledge of gh, ssh, cuda, or any other resource.
+                        Everything the container needs is declared under
+                        `resources:` (an open-ended, named bag of mounts +
+                        env forwards + optional cli precondition-checks).
                         No file + no --auto → error. Both → error.
 
   --capabilities-file FILE
                         Read capabilities from FILE instead of ./capabilities.conf.
   --generate-capabilities [--output FILE] [--interactive]
-                        [--gpu=VAL] [--network-mode=VAL] [--pythonpath-forward=BOOL]
-                        [--latex] [--python-sci] [--ollama]
+                        [--gpu=VAL] [--network-mode=VAL] [--python-mode=VAL]
+                        [--resource NAME:field=value,field=value ...]  (repeatable)
                         Emit a valid capabilities.conf. Prints to stdout unless
-                        --output is given. --interactive prompts for each key.
-                        This CLI is the reference implementation of the format.
+                        --output is given. Same effective inputs → byte-identical
+                        output. This CLI is the reference implementation of
+                        the format; downstream generators (Evolvix `project
+                        install`, #932) must produce files this launcher accepts.
 
-  Capability values (v1):
-    version              1
-    gpu                  none | nvidia | nvidia-runtime | nvidia-passthrough
-                         | amd | intel                            [default: none]
-    network_mode         host | bridge | none                     [default: bridge]
-    pythonpath_forward   true | false                             [default: false]
-    latex                true | false  (requires overlay image)   [default: false]
-    python_sci           true | false  (requires overlay image)   [default: false]
-    ollama               true | false  (requires overlay image)   [default: false]
+  Format (v1 rewrite, #935):
+    version: 1
+    capabilities:
+      gpu: nvidia            # nvidia | dri | kfd | none        [default: none]
+      network_mode: host     # host | bridge | none             [default: bridge]
+      python_mode: link      # link | copy                      [default: link]
+    resources:
+      <operator-chosen name>:      # `github`, `cuda`, `ssh`, `hf_cache`, …
+        cli: gh                    # optional; host-PATH check at start
+        mounts:
+          - <host>:<container>[:ro]     # supports ~ and ${VAR}
+        env:                       # NAMES only — literals go under env_set
+          - GH_TOKEN
+          - GITHUB_TOKEN
+        env_set:                   # non-secret literals only
+          KEY: literal_value
 
-  Deferred / not v1: cuda toolkit, ssh forwarding, host `gh` passthrough
-  (currently unconditional — file an issue if this needs a capability).
+  Resource name is an operator label — the launcher does not recognise it.
+  Adding a new resource (`hf_cache: { mounts: [~/.cache/hf:/root/.cache/hf] }`)
+  needs NO launcher change. `readonly-mounts.conf` and `set-environment-vars.conf`
+  are retired in contract mode (still honoured under --auto for migration).
+
+  DO NOT commit tokens to capabilities.conf. `env:` forwards by name from the
+  launcher's environment; docker never sees the value in argv. `env_set:` is
+  for non-secret literals only (paths, flags), not credentials.
 
 Environment modes:
   --link_environment    (default) Mount host Python site-packages into the
@@ -447,21 +738,26 @@ Persistent worker mode (for MCP dispatch):
                         Repeatable. Values may contain spaces when
                         quoted, e.g. -e "GIT_SSH_COMMAND=ssh -i ...".
 
-API keys and secrets:
-  Create set-environment-vars.conf in the project directory listing files
-  to mount, one per line (relative or absolute paths):
+API keys and secrets (--auto only, retired in contract mode):
+  Under --auto: set-environment-vars.conf in the project directory lists
+  files to mount, one per line (relative or absolute paths):
     setOpenAIKey.sh
     setOpenRouterKey.sh
     /etc/mycompany/env.sh
   .sh files are sourced at startup; all other files are mounted read-only
   at /home/node/api-keys/<basename> but not sourced.
+  Contract mode equivalent: `resources: { openai: { mounts: [...], env: [OPENAI_API_KEY] } }`
+  (source the key script in your host shell before running so the env var
+  can be forwarded by name).
   Never commit secret files to git.
 
-Read-only mounts (configs, data dirs, etc.):
-  Create readonly-mounts.conf listing host paths (files or directories) to
-  mount read-only at the SAME path inside the container, one per line.
+Read-only mounts (--auto only, retired in contract mode):
+  Under --auto: readonly-mounts.conf lists host paths (files or directories)
+  to mount read-only at the SAME path inside the container, one per line.
   Looked up in the project directory first, then in the script directory
   (global default). Both files are read and merged. Supports ~, # comments.
+  Contract mode equivalent: any `resources: { <name>: { mounts: [...] } }`
+  entry — a named resource IS a bag of mounts.
 
 GitHub SSH (push from container without exposing ~/.ssh):
   Generate a dedicated key outside ~/.ssh:
@@ -583,76 +879,68 @@ IMAGE_NAME="claude-code-env"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$HOME/.claude-venv"
 
-# ── Environment variable file discovery ──────────────────────────────
-# Read set-environment-vars.conf if present. Each non-comment line is
-# a shell file to source. Relative paths resolved from the conf file's directory.
+# ── Legacy conf discovery (--auto only, evolvix#935) ─────────────────
+# `set-environment-vars.conf` and `readonly-mounts.conf` are retired in
+# contract mode; the operator declares equivalents under `resources:`
+# (which is a strict superset with named toggles). --auto still honours
+# both so pre-#931 invocations keep working.
 KEY_FILES=()
-API_KEYS_CONF="$PWD/set-environment-vars.conf"
-if [ -f "$API_KEYS_CONF" ]; then
-  CONF_DIR="$(cd "$(dirname "$API_KEYS_CONF")" && pwd)"
-  while IFS= read -r line; do
-    # Skip blank lines and comments
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    # Expand leading ~ to $HOME
-    line="${line/#\~/$HOME}"
-    # Resolve relative paths
-    if [[ "$line" != /* ]]; then
-      line="$CONF_DIR/$line"
-    fi
-    KEY_FILES+=("$line")
-  done < "$API_KEYS_CONF"
-fi
-
-# Build mount flags and container paths list for key files
 KEY_MOUNTS=""
 KEY_PATHS_IN_CONTAINER=""
-for keyfile in "${KEY_FILES[@]}"; do
-  if [ -f "$keyfile" ]; then
-    basename_key="$(basename "$keyfile")"
-    KEY_MOUNTS="$KEY_MOUNTS -v $keyfile:/home/node/api-keys/$basename_key:ro"
-    KEY_PATHS_IN_CONTAINER="$KEY_PATHS_IN_CONTAINER /home/node/api-keys/$basename_key"
-  else
-    echo "==> Warning: key file not found: $keyfile"
-  fi
-done
-
-# Pass the list of key paths into the container via env var
-if [ -n "$KEY_PATHS_IN_CONTAINER" ]; then
-  echo "==> API keys: $(echo $KEY_PATHS_IN_CONTAINER | tr ' ' '\n' | xargs -I{} basename {} | tr '\n' ' ')"
-fi
-
-# ── Read-only mount discovery ────────────────────────────────────────
-# Read readonly-mounts.conf if present. Each non-comment line is a host
-# path mounted read-only at the same path inside the container. Checks
-# project dir first then script dir (global), merging both lists.
 RO_PATHS=()
-_RO_SEEN=""
-for _ro_conf in "$PWD/readonly-mounts.conf" "$SCRIPT_DIR/readonly-mounts.conf"; do
-  [ -f "$_ro_conf" ] || continue
-  _RO_CONF_DIR="$(cd "$(dirname "$_ro_conf")" && pwd)"
-  while IFS= read -r line; do
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    line="${line/#\~/$HOME}"
-    if [[ "$line" != /* ]]; then
-      line="$_RO_CONF_DIR/$line"
-    fi
-    case ":$_RO_SEEN:" in *":$line:"*) continue;; esac
-    _RO_SEEN="${_RO_SEEN:+$_RO_SEEN:}$line"
-    RO_PATHS+=("$line")
-  done < "$_ro_conf"
-done
-
 RO_MOUNTS=""
-for _p in "${RO_PATHS[@]}"; do
-  if [ -e "$_p" ]; then
-    RO_MOUNTS="$RO_MOUNTS -v $_p:$_p:ro"
-  else
-    echo "==> Warning: readonly mount path not found: $_p"
+if [ "$AUTO_MODE" = true ]; then
+  API_KEYS_CONF="$PWD/set-environment-vars.conf"
+  if [ -f "$API_KEYS_CONF" ]; then
+    CONF_DIR="$(cd "$(dirname "$API_KEYS_CONF")" && pwd)"
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      line="${line/#\~/$HOME}"
+      if [[ "$line" != /* ]]; then
+        line="$CONF_DIR/$line"
+      fi
+      KEY_FILES+=("$line")
+    done < "$API_KEYS_CONF"
   fi
-done
-if [ -n "$RO_MOUNTS" ]; then
-  echo "==> Read-only mounts: ${#RO_PATHS[@]} path(s)"
-  for _p in "${RO_PATHS[@]}"; do echo "    $_p"; done
+  for keyfile in "${KEY_FILES[@]}"; do
+    if [ -f "$keyfile" ]; then
+      basename_key="$(basename "$keyfile")"
+      KEY_MOUNTS="$KEY_MOUNTS -v $keyfile:/home/node/api-keys/$basename_key:ro"
+      KEY_PATHS_IN_CONTAINER="$KEY_PATHS_IN_CONTAINER /home/node/api-keys/$basename_key"
+    else
+      echo "==> Warning: key file not found: $keyfile"
+    fi
+  done
+  if [ -n "$KEY_PATHS_IN_CONTAINER" ]; then
+    echo "==> API keys: $(echo $KEY_PATHS_IN_CONTAINER | tr ' ' '\n' | xargs -I{} basename {} | tr '\n' ' ')"
+  fi
+
+  _RO_SEEN=""
+  for _ro_conf in "$PWD/readonly-mounts.conf" "$SCRIPT_DIR/readonly-mounts.conf"; do
+    [ -f "$_ro_conf" ] || continue
+    _RO_CONF_DIR="$(cd "$(dirname "$_ro_conf")" && pwd)"
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      line="${line/#\~/$HOME}"
+      if [[ "$line" != /* ]]; then
+        line="$_RO_CONF_DIR/$line"
+      fi
+      case ":$_RO_SEEN:" in *":$line:"*) continue;; esac
+      _RO_SEEN="${_RO_SEEN:+$_RO_SEEN:}$line"
+      RO_PATHS+=("$line")
+    done < "$_ro_conf"
+  done
+  for _p in "${RO_PATHS[@]}"; do
+    if [ -e "$_p" ]; then
+      RO_MOUNTS="$RO_MOUNTS -v $_p:$_p:ro"
+    else
+      echo "==> Warning: readonly mount path not found: $_p"
+    fi
+  done
+  if [ -n "$RO_MOUNTS" ]; then
+    echo "==> Read-only mounts: ${#RO_PATHS[@]} path(s)"
+    for _p in "${RO_PATHS[@]}"; do echo "    $_p"; done
+  fi
 fi
 
 # Detect host Python site-packages for --link_environment
@@ -678,8 +966,20 @@ if command -v python3 &>/dev/null; then
   fi
 fi
 
-# Determine env mode: default to link (shared host env) if host Python exists
-if [ -z "$ENV_MODE" ]; then
+# Determine env mode. Contract mode (evolvix#935): `capabilities.python_mode`
+# forces it; passing --link_environment / --copy_environment alongside a
+# capabilities.conf is an error (the contract is deterministic — CLI overrides
+# would reintroduce the silent-inheritance pattern #931 exists to remove).
+# --auto: fall back to the pre-#931 detection (link if host has python, else
+# copy if requirements.txt exists).
+if [ "$AUTO_MODE" = false ]; then
+  if [ -n "$ENV_MODE" ] && [ "$ENV_MODE" != "$CAP_python_mode" ]; then
+    echo "ERROR: --${ENV_MODE}_environment conflicts with capabilities.python_mode=$CAP_python_mode." >&2
+    echo "       In contract mode the capability wins. Drop the CLI flag or update the config." >&2
+    exit 2
+  fi
+  ENV_MODE="$CAP_python_mode"
+elif [ -z "$ENV_MODE" ]; then
   if [ -n "$HOST_SITE_PACKAGES" ] && [ -d "$HOST_SITE_PACKAGES" ]; then
     ENV_MODE="link"
   elif [ -f "$SCRIPT_DIR/requirements.txt" ]; then
@@ -746,12 +1046,14 @@ if [ "$AUTO_MODE" = true ]; then
   fi
   [ -n "$(echo "$GPU_FLAG" | grep -o '/dev/dri\|/dev/kfd')" ] && echo "==> GPU: AMD/Intel (DRI render nodes)"
 else
-  # Contract mode: apply the requested GPU capability, error if the host
-  # can't satisfy it. Also validate overlay labels on the image.
+  # Contract mode (evolvix#935): apply the requested GPU capability and
+  # emit `-v`/`-e` flags for every declared resource. Overlays are no
+  # longer capabilities — they're image labels a caller can inspect but
+  # the launcher does not require. Under the v1-rewrite `resources:`
+  # model, everything the container needs (gh, ssh, cuda, huggingface,
+  # …) is a resource entry, not a hardcoded launcher behaviour.
   capabilities_apply_gpu
-  capabilities_check_overlay latex      claude.overlay.latex
-  capabilities_check_overlay python_sci claude.overlay.python-sci
-  capabilities_check_overlay ollama     claude.overlay.ollama
+  capabilities_apply_resources
 fi
 
 # ── Build env-specific docker flags ──────────────────────────────────
@@ -774,12 +1076,17 @@ if [ -n "$MAIN_REPO_DIR" ] && [ "$MAIN_REPO_DIR" != "$PROJECT_DIR" ]; then
   MAIN_REPO_MOUNT="-v $MAIN_REPO_DIR:$MAIN_REPO_DIR"
 fi
 
-# Mount host tools that are already installed into a guaranteed-in-PATH location
+# Mount host tools into a guaranteed-in-PATH location.
+# Under the v1-rewrite `resources:` model (#935), `gh` is NOT a launcher
+# assumption — declare it as a resource (mount host `gh` into the
+# container). --auto keeps the pre-#931 unconditional passthrough.
 HOST_TOOL_MOUNTS=""
-for tool in gh; do
-  tool_path="$(command -v "$tool" 2>/dev/null || true)"
-  [ -n "$tool_path" ] && HOST_TOOL_MOUNTS="$HOST_TOOL_MOUNTS -v $tool_path:/usr/local/bin/$tool:ro"
-done
+if [ "$AUTO_MODE" = true ]; then
+  for tool in gh; do
+    tool_path="$(command -v "$tool" 2>/dev/null || true)"
+    [ -n "$tool_path" ] && HOST_TOOL_MOUNTS="$HOST_TOOL_MOUNTS -v $tool_path:/usr/local/bin/$tool:ro"
+  done
+fi
 
 # Same-path bind mounts so a host venv (and its base interpreter + stdlib) is
 # usable inside the container. Only built in link mode; non-link projects fall
@@ -793,10 +1100,14 @@ if [ "$ENV_MODE" = "link" ]; then
   [ -n "$HOST_VENV" ]      && ENV_VARS="$ENV_VARS -e HOST_VENV=$HOST_VENV"
 fi
 
-# Mount host CUDA toolkit if present — host HOOMD may be linked against
-# /usr/local/cuda/.../libcudart.so. --gpus all only injects the driver.
+# Mount host CUDA toolkit if present.
+# Under contract mode (#935) CUDA is NOT auto-mounted — declare it as a
+# resource: `cuda: { mounts: [/usr/local/cuda:/usr/local/cuda:ro], env: [CUDA_HOME] }`.
+# --auto keeps the pre-#931 unconditional mount.
 CUDA_MOUNT=""
-[ -d /usr/local/cuda ] && CUDA_MOUNT="-v /usr/local/cuda:/usr/local/cuda:ro"
+if [ "$AUTO_MODE" = true ] && [ -d /usr/local/cuda ]; then
+  CUDA_MOUNT="-v /usr/local/cuda:/usr/local/cuda:ro"
+fi
 
 # Mount each host PYTHONPATH directory read-only at the same path so dev
 # packages (e.g. editable installs activated via `export PYTHONPATH=...`)
@@ -804,11 +1115,12 @@ CUDA_MOUNT=""
 # (project, main repo, host venv) are skipped to avoid double-mount.
 PYTHONPATH_MOUNTS=""
 PYTHONPATH_IN_CONTAINER=""
-# Contract mode with pythonpath_forward:false must NOT forward the host's
-# PYTHONPATH — the whole point of the contract is host-independent
-# containers (evolvix#931). --auto (or contract with forward:true) keeps
-# the pre-#931 auto-forward.
-if [ "$AUTO_MODE" = false ] && [ "${CAP_pythonpath_forward:-false}" != "true" ]; then
+# Contract mode: PYTHONPATH forwarding is intrinsic to `python_mode: link`
+# (the container reads packages from the host venv, so its dev-package
+# imports need the same host paths). `python_mode: copy` isolates via a
+# baked venv → no host PYTHONPATH forwarding. --auto keeps the pre-#931
+# forward-if-set behaviour.
+if [ "$AUTO_MODE" = false ] && [ "${CAP_python_mode:-link}" != "link" ]; then
   :  # skip
 elif [ -n "${PYTHONPATH:-}" ]; then
   _SEEN=""
@@ -843,10 +1155,14 @@ fi
 
 # ── Daemon-only mounts ───────────────────────────────────────────────
 # Mount the host's ~/.ssh read-only so the container inherits the host's
-# key-alias mapping from ~/.ssh/config. No config generation happens inside
-# the container.
+# key-alias mapping from ~/.ssh/config.
+#
+# Under contract mode (#935) the launcher does not touch ~/.ssh — declare
+# it as a resource: `ssh: { mounts: [~/.ssh:/home/node/.ssh:ro] }` (or
+# `ssh: { mounts: [${SSH_AUTH_SOCK}:/ssh-agent], env_set: {SSH_AUTH_SOCK: /ssh-agent} }`
+# for agent forwarding). --auto keeps the pre-#931 automatic mount.
 SSH_MOUNTS=""
-if [ "$DAEMON_MODE" = true ] && [ -d "$HOME/.ssh" ]; then
+if [ "$AUTO_MODE" = true ] && [ "$DAEMON_MODE" = true ] && [ -d "$HOME/.ssh" ]; then
   SSH_MOUNTS="-v $HOME/.ssh:/home/node/.ssh:ro"
 fi
 
@@ -933,6 +1249,9 @@ if [ "$DAEMON_MODE" = true ]; then
     $HOST_TOOL_MOUNTS \
     $SSH_MOUNTS \
     $DISPATCH_MOUNTS \
+    $RESOURCE_MOUNTS \
+    $RESOURCE_ENV_FLAGS \
+    "${RESOURCE_ENV_SET_LITERALS[@]}" \
     $ENV_VARS \
     $ENV_FILE_FLAG \
     "${EXTRA_ENV_FLAGS[@]}" \
@@ -1024,6 +1343,9 @@ exec docker run -it --rm \
   $KEY_MOUNTS \
   $RO_MOUNTS \
   $HOST_TOOL_MOUNTS \
+  $RESOURCE_MOUNTS \
+  $RESOURCE_ENV_FLAGS \
+  "${RESOURCE_ENV_SET_LITERALS[@]}" \
   $ENV_VARS \
   $ENV_FILE_FLAG \
   "${EXTRA_ENV_FLAGS[@]}" \

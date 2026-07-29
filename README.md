@@ -23,16 +23,16 @@ Run `claude-docker.sh --help` for the full flag list.
 
 ## Capability contract
 
-Since [evolvix#931](https://github.com/yehudarav/Evolvix/issues/931) the launcher runs in **one of two mutually exclusive modes**:
+Since [evolvix#931](https://github.com/yehudarav/Evolvix/issues/931) (reshaped by [evolvix#935](https://github.com/yehudarav/Evolvix/issues/935)) the launcher runs in **one of two mutually exclusive modes**:
 
-- **contract mode** (default) — reads a versioned `capabilities.conf` in the current directory and applies exactly what it says. Two hosts with the same file get equivalent containers. Missing or invalid keys are errors, never silent defaults.
-- **`--auto` mode** — the pre-#931 behaviour (auto-detect GPU, hardcoded `--network host` interactive, PYTHONPATH forwarding when `$PYTHONPATH` is set). Fast for one-off runs; not deterministic across hosts.
+- **contract mode** (default) — reads a versioned `capabilities.conf` in the current directory and applies exactly what it says. Two hosts with the same file get equivalent containers. Missing or invalid keys are errors, never silent defaults. **The launcher makes no assumptions**: it has no built-in knowledge of `gh`, `ssh`, `cuda`, or any other resource. Everything the container needs is declared under `resources:`.
+- **`--auto` mode** — the pre-#931 behaviour (auto-detect GPU, hardcoded `--network host` interactive, PYTHONPATH forwarding, hardcoded `gh`/`~/.ssh`/CUDA mounts, `set-environment-vars.conf`, `readonly-mounts.conf`). Fast for one-off runs and migration; **not** deterministic across hosts.
 
 Neither present → error. Both present → error. `--stop` / `--status` bypass the check.
 
 ### Migration
 
-If you were running `claude-docker.sh` before #931 and want the old behaviour:
+Pre-#931 behaviour one-liner:
 
 ```sh
 claude-docker.sh --auto
@@ -41,40 +41,81 @@ claude-docker.sh --auto
 To adopt the contract, generate a config:
 
 ```sh
-claude-docker.sh --generate-capabilities --output capabilities.conf --gpu=nvidia --network-mode=host
+claude-docker.sh --generate-capabilities --output capabilities.conf \
+  --gpu=nvidia --network-mode=host --python-mode=link \
+  --resource "github:cli=gh,mount=~/.config/gh:/home/node/.config/gh:ro,env=GH_TOKEN,env=GITHUB_TOKEN" \
+  --resource "cuda:mount=/usr/local/cuda:/usr/local/cuda:ro,env=CUDA_HOME"
 ```
 
 Interactive users who relied on `localhost` reaching the host **must** set `network_mode: host` in the config — contract mode defaults to `bridge` on all paths.
 
-### The format (v1)
+### The format (v1 rewrite, #935)
 
-```
+```yaml
 version: 1
-gpu: nvidia
-network_mode: host
-pythonpath_forward: false
-latex: false
-python_sci: false
-ollama: false
+capabilities:
+  gpu: nvidia            # nvidia | dri | kfd | none
+  network_mode: host     # host | bridge | none
+  python_mode: link      # link | copy
+resources:
+  github:
+    cli: gh                                        # optional host-PATH check
+    mounts:
+      - ~/.config/gh:/home/node/.config/gh:ro      # supports ~ and ${VAR}
+    env:                                           # NAMES only, never values
+      - GH_TOKEN
+      - GITHUB_TOKEN
+      - GIT_SSH_COMMAND
+  ssh:
+    mounts:
+      - ${SSH_AUTH_SOCK}:/ssh-agent
+    env_set:                                       # non-secret literals only
+      SSH_AUTH_SOCK: /ssh-agent
+  cuda:
+    mounts:
+      - /usr/local/cuda-12.4:/usr/local/cuda:ro
+    env:
+      - CUDA_HOME
 ```
 
 - `version:` **required**. Missing → error, unsupported → error (never a default).
-- Unknown keys → error (never silent).
-- Requested-but-unavailable capability → error at container start, naming what's missing.
+- Unknown top-level keys → error. Unknown keys under `capabilities:` → error.
+- Requested-but-unavailable capability → error at start, naming what's missing.
+- A declared mount whose host source doesn't exist → error at start.
+- A declared `cli` not on the host `PATH` → error at start.
 
-Keys and accepted values:
+**A resource key (`github`, `cuda`, `ssh`, `huggingface`, …) is an operator's label. The launcher does not recognise it and has no table of known services.** That's what makes the format general: adding a huggingface cache tomorrow is a config entry, never a launcher change.
+
+The **service** is the resource (`github`) — the mount path (`~/.config/gh`) and variable names (`GH_TOKEN`) are the tool's actual identifiers, literal, not derived from the resource key.
+
+### Categories
+
+Two sections, different jobs:
+
+- **`capabilities:`** — launcher behaviours. Finite, each needs specific docker flags, the launcher must know every name. Currently: `gpu`, `network_mode`, `python_mode`.
+- **`resources:`** — mounts + env forwards. Open-ended, launcher never has to know a name. Adds any credential-carrying tool, data cache, or agent socket without touching launcher code.
+
+### Field semantics
+
+| Field | Purpose |
+|---|---|
+| `cli` (optional) | Precondition-check the binary exists on the host `PATH`. Failure at start beats a dispatch failing at finalize because the image lacks it. |
+| `mounts` (list) | Bind mounts, format `host:container[:ro]`. `~` expands to `$HOME`; `${VAR}` expands from the launcher environment. Sources must exist on the host or startup errors. |
+| `env` (list) | Environment variable **names** to forward from the launcher's process to the container (docker `-e KEY` with no value — the value never enters argv). Never write values here — `capabilities.conf` is committed to git. |
+| `env_set` (mapping) | Literal `KEY: value` written into the container as `-e KEY=value`. For **non-secret** literals only (SSH socket paths, feature flags). Never credentials. |
+
+### Retired files
+
+`set-environment-vars.conf` and `readonly-mounts.conf` (both discovered by [evolvix#930](https://github.com/yehudarav/Evolvix/issues/930)) are retired in contract mode — `resources:` is a strict superset that toggles them as named units. Both are still honoured under `--auto` for migration.
+
+### Enum values (`capabilities:`)
 
 | Key | Values | Default | Notes |
 |---|---|---|---|
-| `version` | `1` | — | Required. |
-| `gpu` | `none` \| `nvidia` \| `nvidia-runtime` \| `nvidia-passthrough` \| `amd` \| `intel` | `none` | `nvidia` prefers the container runtime, falls back to device passthrough. Errors if neither is present on the host. |
+| `version` | `1` | — | Required. Missing → error, unsupported → error. |
+| `gpu` | `none` \| `nvidia` \| `dri` \| `kfd` | `none` | `nvidia` prefers the container runtime, falls back to `/dev/nvidia*` passthrough. `dri` = `/dev/dri/renderD*` (AMD or Intel). `kfd` = ROCm (`/dev/kfd` + `/dev/dri`). Errors if the host can't satisfy. |
 | `network_mode` | `host` \| `bridge` \| `none` | `bridge` | Applied uniformly to interactive and daemon paths. |
-| `pythonpath_forward` | `true` \| `false` | `false` | When `true` and `$PYTHONPATH` is set on the host, each directory is bind-mounted read-only at the same path and `PYTHONPATH` is forwarded. |
-| `latex` | `true` \| `false` | `false` | Requires the LaTeX overlay (`make docker-add-latex`, adds label `claude.overlay.latex=1`). |
-| `python_sci` | `true` \| `false` | `false` | Requires the python-sci overlay (`make docker-add-python-sci`, label `claude.overlay.python-sci=1`). |
-| `ollama` | `true` \| `false` | `false` | Requires the ollama overlay (`make docker-add-ollama`, label `claude.overlay.ollama=1`). |
-
-Deferred to a later version (currently unconditional): CUDA toolkit mount, SSH forwarding (daemon-only), host `gh` passthrough. File an issue if you need these as capabilities.
+| `python_mode` | `link` \| `copy` | `link` | `link` = mount host site-packages (fast), forwards host `$PYTHONPATH`. `copy` = isolated venv at `~/.claude-venv`, no PYTHONPATH forwarding. In contract mode this overrides `--link_environment` / `--copy_environment`. |
 
 ### Discovery
 
@@ -83,23 +124,17 @@ Contract mode looks up the config in **one place only**:
 1. `--capabilities-file PATH` if given, else
 2. `./capabilities.conf` in the current directory.
 
-There is no merge with a global default. That is deliberate — the whole point is that two hosts with the same file produce equivalent containers.
+**No merge with a global default.** That is deliberate — the whole point is that two hosts with the same file produce equivalent containers.
 
 ### Image overlay labels
 
-Overlays declare their presence with a Docker image label:
-
-| Overlay | Label |
-|---|---|
-| LaTeX | `claude.overlay.latex=1` |
-| python-sci | `claude.overlay.python-sci=1` |
-| ollama | `claude.overlay.ollama=1` |
-
-The launcher inspects the image and errors if `capabilities.conf` requests an overlay whose label isn't present. Inspect what's baked into your image:
+The overlay Dockerfiles stamp identifying labels (`claude.overlay.latex=1`, `claude.overlay.python-sci=1`, `claude.overlay.ollama=1`) so operators can inspect what's baked into an image. They are informational under #935 (the launcher no longer enforces them via capabilities). Inspect:
 
 ```sh
 docker image inspect claude-code-env --format '{{json .Config.Labels}}' | jq
 ```
+
+If a resource needs a CLI baked into the image (e.g. `huggingface-cli`), declare it with `cli: huggingface-cli` — the check verifies the binary is on the host PATH (mount it into the container via `mounts:` if it's not baked in).
 
 ### Generator CLI
 
@@ -108,19 +143,21 @@ The launcher itself is the reference implementation of the format:
 ```sh
 # Flag-driven
 claude-docker.sh --generate-capabilities \
-  --gpu=nvidia --network-mode=host --pythonpath-forward=false \
-  --latex --output capabilities.conf
+  --gpu=nvidia --network-mode=host --python-mode=link \
+  --resource "github:cli=gh,mount=~/.config/gh:/home/node/.config/gh:ro,env=GH_TOKEN,env=GITHUB_TOKEN" \
+  --resource "cuda:mount=/usr/local/cuda:/usr/local/cuda:ro,env=CUDA_HOME" \
+  --output capabilities.conf
 
-# Interactive prompt for each key
+# Interactive prompt for capabilities: values (resources still via flags)
 claude-docker.sh --generate-capabilities --interactive --output capabilities.conf
 
 # Print to stdout instead of writing a file
 claude-docker.sh --generate-capabilities --gpu=none
 ```
 
-For the same effective inputs both paths produce byte-identical output — that IS the contract.
+For the same effective inputs both paths produce **byte-identical** output — that IS the contract.
 
-Downstream generators (e.g. Evolvix's `project install`) must produce files this launcher accepts. If a downstream generator disagrees with `claude-docker.sh --generate-capabilities`, the launcher is correct.
+Downstream generators (e.g. Evolvix's `project install`, [evolvix#932](https://github.com/yehudarav/Evolvix/issues/932)) must produce files this launcher accepts. If a downstream generator disagrees with `claude-docker.sh --generate-capabilities`, the launcher is correct.
 
 ### Tests
 
@@ -128,7 +165,7 @@ Downstream generators (e.g. Evolvix's `project install`) must produce files this
 bash tests/test_capabilities.sh
 ```
 
-Exercises the contract's error paths (missing/unknown/unsupported/malformed), the round-trip (generator → parser), and generator determinism. Does not start any container.
+Exercises the error paths (missing/unknown/unsupported/malformed/missing-mount/missing-cli/env-value-leak), generator→parser round-trip **including a resource the launcher has never seen**, generator determinism, and `${VAR}` expansion. Does not start any container.
 
 ## Python environment
 
