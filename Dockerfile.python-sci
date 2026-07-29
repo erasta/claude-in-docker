@@ -2,6 +2,10 @@
 # on top of an already-built claude-code-env.
 FROM claude-code-env
 
+# Overlay marker — the launcher requires this when capabilities.conf sets
+# python_sci: true (evolvix#931).
+LABEL claude.overlay.python-sci=1
+
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

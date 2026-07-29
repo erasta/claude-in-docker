@@ -8,6 +8,12 @@
 # scientific wheels link against.
 FROM node:20-trixie
 
+# Declare this as a claude-docker base image. Overlays add their own
+# claude.overlay.<name>=1 labels; the launcher validates a
+# capabilities.conf's requested overlays against these labels (evolvix#931).
+LABEL claude.image=1
+LABEL claude.image.version=1
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \

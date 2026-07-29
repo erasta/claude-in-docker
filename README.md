@@ -21,6 +21,115 @@ claude-docker.sh
 
 Run `claude-docker.sh --help` for the full flag list.
 
+## Capability contract
+
+Since [evolvix#931](https://github.com/yehudarav/Evolvix/issues/931) the launcher runs in **one of two mutually exclusive modes**:
+
+- **contract mode** (default) — reads a versioned `capabilities.conf` in the current directory and applies exactly what it says. Two hosts with the same file get equivalent containers. Missing or invalid keys are errors, never silent defaults.
+- **`--auto` mode** — the pre-#931 behaviour (auto-detect GPU, hardcoded `--network host` interactive, PYTHONPATH forwarding when `$PYTHONPATH` is set). Fast for one-off runs; not deterministic across hosts.
+
+Neither present → error. Both present → error. `--stop` / `--status` bypass the check.
+
+### Migration
+
+If you were running `claude-docker.sh` before #931 and want the old behaviour:
+
+```sh
+claude-docker.sh --auto
+```
+
+To adopt the contract, generate a config:
+
+```sh
+claude-docker.sh --generate-capabilities --output capabilities.conf --gpu=nvidia --network-mode=host
+```
+
+Interactive users who relied on `localhost` reaching the host **must** set `network_mode: host` in the config — contract mode defaults to `bridge` on all paths.
+
+### The format (v1)
+
+```
+version: 1
+gpu: nvidia
+network_mode: host
+pythonpath_forward: false
+latex: false
+python_sci: false
+ollama: false
+```
+
+- `version:` **required**. Missing → error, unsupported → error (never a default).
+- Unknown keys → error (never silent).
+- Requested-but-unavailable capability → error at container start, naming what's missing.
+
+Keys and accepted values:
+
+| Key | Values | Default | Notes |
+|---|---|---|---|
+| `version` | `1` | — | Required. |
+| `gpu` | `none` \| `nvidia` \| `nvidia-runtime` \| `nvidia-passthrough` \| `amd` \| `intel` | `none` | `nvidia` prefers the container runtime, falls back to device passthrough. Errors if neither is present on the host. |
+| `network_mode` | `host` \| `bridge` \| `none` | `bridge` | Applied uniformly to interactive and daemon paths. |
+| `pythonpath_forward` | `true` \| `false` | `false` | When `true` and `$PYTHONPATH` is set on the host, each directory is bind-mounted read-only at the same path and `PYTHONPATH` is forwarded. |
+| `latex` | `true` \| `false` | `false` | Requires the LaTeX overlay (`make docker-add-latex`, adds label `claude.overlay.latex=1`). |
+| `python_sci` | `true` \| `false` | `false` | Requires the python-sci overlay (`make docker-add-python-sci`, label `claude.overlay.python-sci=1`). |
+| `ollama` | `true` \| `false` | `false` | Requires the ollama overlay (`make docker-add-ollama`, label `claude.overlay.ollama=1`). |
+
+Deferred to a later version (currently unconditional): CUDA toolkit mount, SSH forwarding (daemon-only), host `gh` passthrough. File an issue if you need these as capabilities.
+
+### Discovery
+
+Contract mode looks up the config in **one place only**:
+
+1. `--capabilities-file PATH` if given, else
+2. `./capabilities.conf` in the current directory.
+
+There is no merge with a global default. That is deliberate — the whole point is that two hosts with the same file produce equivalent containers.
+
+### Image overlay labels
+
+Overlays declare their presence with a Docker image label:
+
+| Overlay | Label |
+|---|---|
+| LaTeX | `claude.overlay.latex=1` |
+| python-sci | `claude.overlay.python-sci=1` |
+| ollama | `claude.overlay.ollama=1` |
+
+The launcher inspects the image and errors if `capabilities.conf` requests an overlay whose label isn't present. Inspect what's baked into your image:
+
+```sh
+docker image inspect claude-code-env --format '{{json .Config.Labels}}' | jq
+```
+
+### Generator CLI
+
+The launcher itself is the reference implementation of the format:
+
+```sh
+# Flag-driven
+claude-docker.sh --generate-capabilities \
+  --gpu=nvidia --network-mode=host --pythonpath-forward=false \
+  --latex --output capabilities.conf
+
+# Interactive prompt for each key
+claude-docker.sh --generate-capabilities --interactive --output capabilities.conf
+
+# Print to stdout instead of writing a file
+claude-docker.sh --generate-capabilities --gpu=none
+```
+
+For the same effective inputs both paths produce byte-identical output — that IS the contract.
+
+Downstream generators (e.g. Evolvix's `project install`) must produce files this launcher accepts. If a downstream generator disagrees with `claude-docker.sh --generate-capabilities`, the launcher is correct.
+
+### Tests
+
+```sh
+bash tests/test_capabilities.sh
+```
+
+Exercises the contract's error paths (missing/unknown/unsupported/malformed), the round-trip (generator → parser), and generator determinism. Does not start any container.
+
 ## Python environment
 
 Two modes, chosen at startup:

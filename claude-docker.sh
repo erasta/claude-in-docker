@@ -9,6 +9,281 @@ if [ -f "$HOME/.claude/docker.env" ]; then
   . "$HOME/.claude/docker.env"
 fi
 
+# ── Capability contract (evolvix#931) ────────────────────────────────
+# The launcher runs in one of two modes:
+#   * contract  — read capabilities.conf, validate, apply exactly what it says
+#   * --auto    — auto-detect GPU / network / PYTHONPATH exactly as before
+# Fail-closed: neither mode selected + no config present → error.
+# See README ("Capability contract").
+
+CAP_SUPPORTED_VERSIONS="1"
+CAP_KNOWN_KEYS=" version gpu network_mode pythonpath_forward latex python_sci ollama "
+
+CAP_DEFAULT_gpu="none"
+CAP_DEFAULT_network_mode="bridge"
+CAP_DEFAULT_pythonpath_forward="false"
+CAP_DEFAULT_latex="false"
+CAP_DEFAULT_python_sci="false"
+CAP_DEFAULT_ollama="false"
+
+CAP_ALLOWED_gpu=" none nvidia nvidia-runtime nvidia-passthrough amd intel "
+CAP_ALLOWED_network_mode=" host bridge none "
+CAP_ALLOWED_pythonpath_forward=" true false "
+CAP_ALLOWED_latex=" true false "
+CAP_ALLOWED_python_sci=" true false "
+CAP_ALLOWED_ollama=" true false "
+
+# capabilities_validate_value KEY VALUE
+# Exit 2 with an error if VALUE is not in CAP_ALLOWED_<KEY>. No-op when the
+# key has no allow-list (all keys currently do; keeps the helper generic).
+capabilities_validate_value() {
+  local key="$1"
+  local val="$2"
+  local allowed_var="CAP_ALLOWED_${key}"
+  local allowed="${!allowed_var:-}"
+  [ -z "$allowed" ] && return 0
+  if [[ ! " $allowed " == *" $val "* ]]; then
+    echo "ERROR: capability '$key' has invalid value '$val' (allowed:$allowed)" >&2
+    exit 2
+  fi
+}
+
+# capabilities_parse PATH
+# Reads the file at PATH, validates every line, and populates CAP_<key>
+# globals. A missing `version` is an error (never a default). An unknown
+# key is an error (never silent). An unsupported version is an error.
+capabilities_parse() {
+  local path="$1"
+  local line key val version_seen=0
+  CAP_gpu="$CAP_DEFAULT_gpu"
+  CAP_network_mode="$CAP_DEFAULT_network_mode"
+  CAP_pythonpath_forward="$CAP_DEFAULT_pythonpath_forward"
+  CAP_latex="$CAP_DEFAULT_latex"
+  CAP_python_sci="$CAP_DEFAULT_python_sci"
+  CAP_ollama="$CAP_DEFAULT_ollama"
+  CAP_version=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+    if [[ ! "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+      echo "ERROR: $path: malformed line (expected 'key: value'): $line" >&2
+      exit 2
+    fi
+    key="${BASH_REMATCH[1]}"
+    val="${BASH_REMATCH[2]}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    if [[ ! " $CAP_KNOWN_KEYS " == *" $key "* ]]; then
+      echo "ERROR: $path: unknown key '$key' (known:$CAP_KNOWN_KEYS)" >&2
+      exit 2
+    fi
+    if [ "$key" = "version" ]; then
+      if [[ ! " $CAP_SUPPORTED_VERSIONS " == *" $val "* ]]; then
+        echo "ERROR: $path: unsupported version '$val' (this launcher supports: $CAP_SUPPORTED_VERSIONS)" >&2
+        exit 2
+      fi
+      CAP_version="$val"
+      version_seen=1
+      continue
+    fi
+    capabilities_validate_value "$key" "$val"
+    printf -v "CAP_${key}" '%s' "$val"
+  done < "$path"
+  if [ "$version_seen" -eq 0 ]; then
+    echo "ERROR: $path: missing required 'version' key (must be one of: $CAP_SUPPORTED_VERSIONS)" >&2
+    exit 2
+  fi
+}
+
+# capabilities_apply_gpu
+# Sets GPU_FLAG per CAP_gpu and errors if the host lacks the requested
+# hardware. `none` produces an empty GPU_FLAG regardless of host.
+capabilities_apply_gpu() {
+  local flags=""
+  case "$CAP_gpu" in
+    none)
+      GPU_FLAG=""
+      echo "==> GPU: disabled (capability: none)"
+      ;;
+    nvidia-runtime)
+      if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
+        GPU_FLAG="--gpus all"
+        echo "==> GPU: NVIDIA container runtime (capability: nvidia-runtime)"
+      else
+        echo "ERROR: capability 'gpu: nvidia-runtime' requested but nvidia container runtime is not registered with Docker." >&2
+        echo "       Install nvidia-container-toolkit: $(dirname "${BASH_SOURCE[0]}")/setup-gpu.sh" >&2
+        exit 2
+      fi
+      ;;
+    nvidia-passthrough)
+      for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+        [ -c "$dev" ] && flags="$flags --device $dev"
+      done
+      if [ -n "$flags" ]; then
+        GPU_FLAG="$flags"
+        echo "==> GPU: NVIDIA device passthrough (capability: nvidia-passthrough)"
+      else
+        echo "ERROR: capability 'gpu: nvidia-passthrough' requested but no /dev/nvidia* devices found." >&2
+        exit 2
+      fi
+      ;;
+    nvidia)
+      if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
+        GPU_FLAG="--gpus all"
+        echo "==> GPU: NVIDIA container runtime (capability: nvidia)"
+      else
+        for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+          [ -c "$dev" ] && flags="$flags --device $dev"
+        done
+        if [ -n "$flags" ]; then
+          GPU_FLAG="$flags"
+          echo "==> GPU: NVIDIA device passthrough (capability: nvidia)"
+        else
+          echo "ERROR: capability 'gpu: nvidia' requested but no NVIDIA runtime or /dev/nvidia* devices found." >&2
+          exit 2
+        fi
+      fi
+      ;;
+    amd)
+      for dev in /dev/dri/renderD*; do
+        [ -c "$dev" ] && flags="$flags --device $dev"
+      done
+      [ -c /dev/kfd ] && flags="$flags --device /dev/kfd"
+      if [ -n "$flags" ]; then
+        GPU_FLAG="$flags"
+        echo "==> GPU: AMD (capability: amd)"
+      else
+        echo "ERROR: capability 'gpu: amd' requested but no /dev/dri/renderD* or /dev/kfd found." >&2
+        exit 2
+      fi
+      ;;
+    intel)
+      for dev in /dev/dri/renderD*; do
+        [ -c "$dev" ] && flags="$flags --device $dev"
+      done
+      if [ -n "$flags" ]; then
+        GPU_FLAG="$flags"
+        echo "==> GPU: Intel (capability: intel)"
+      else
+        echo "ERROR: capability 'gpu: intel' requested but no /dev/dri/renderD* found." >&2
+        exit 2
+      fi
+      ;;
+  esac
+}
+
+# capabilities_apply_network
+# Sets NETWORK_FLAG per CAP_network_mode. Applied uniformly to interactive
+# and daemon paths (--auto keeps the old interactive=host / daemon=bridge
+# split).
+capabilities_apply_network() {
+  case "$CAP_network_mode" in
+    host)   NETWORK_FLAG="--network host" ;;
+    bridge) NETWORK_FLAG="" ;;
+    none)   NETWORK_FLAG="--network none" ;;
+  esac
+  echo "==> Network: $CAP_network_mode (capability)"
+}
+
+# capabilities_check_overlay CAP LABEL
+# Errors if CAP_<cap> is true but the image lacks LABEL=1.
+capabilities_check_overlay() {
+  local cap="$1"
+  local label_name="$2"
+  local var="CAP_${cap}"
+  local requested="${!var}"
+  [ "$requested" = "true" ] || return 0
+  local val
+  val="$(docker image inspect "$IMAGE_NAME" --format "{{ index .Config.Labels \"$label_name\" }}" 2>/dev/null || true)"
+  if [ "$val" != "1" ]; then
+    local make_target
+    case "$cap" in
+      latex)      make_target="make docker-add-latex" ;;
+      python_sci) make_target="make docker-add-python-sci" ;;
+      ollama)     make_target="make docker-add-ollama" ;;
+    esac
+    echo "ERROR: capability '$cap: true' requested but image '$IMAGE_NAME' lacks label '$label_name=1'." >&2
+    echo "       Build the overlay first: $make_target" >&2
+    exit 2
+  fi
+  echo "==> Overlay: $cap present (image label $label_name=1)"
+}
+
+# capabilities_generate — writes a capabilities.conf to stdout or --output PATH.
+# Non-interactive by default; per-key flags supply values. `--interactive`
+# prompts for each key. Both paths produce byte-identical output for the
+# same effective inputs (that IS the contract, evolvix#931).
+capabilities_generate() {
+  local output_file="" interactive=false
+  local gen_gpu="none" gen_network="bridge" gen_pypath="false"
+  local gen_latex="false" gen_python_sci="false" gen_ollama="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output)
+        if [ -z "${2:-}" ]; then
+          echo "ERROR: --output requires a value" >&2
+          exit 2
+        fi
+        output_file="$2"; shift 2
+        ;;
+      --interactive) interactive=true; shift ;;
+      --gpu=*)                gen_gpu="${1#*=}"; shift ;;
+      --network-mode=*)       gen_network="${1#*=}"; shift ;;
+      --pythonpath-forward=*) gen_pypath="${1#*=}"; shift ;;
+      --latex)                gen_latex="true"; shift ;;
+      --python-sci)           gen_python_sci="true"; shift ;;
+      --ollama)               gen_ollama="true"; shift ;;
+      *)
+        echo "ERROR: --generate-capabilities: unknown argument: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if [ "$interactive" = true ]; then
+    local ans
+    printf "gpu [%s] (%s): " "$gen_gpu" "$(echo "$CAP_ALLOWED_gpu" | sed 's/^ *//;s/ *$//;s/ /|/g')" >&2
+    read -r ans; [ -n "$ans" ] && gen_gpu="$ans"
+    printf "network_mode [%s] (%s): " "$gen_network" "$(echo "$CAP_ALLOWED_network_mode" | sed 's/^ *//;s/ *$//;s/ /|/g')" >&2
+    read -r ans; [ -n "$ans" ] && gen_network="$ans"
+    printf "pythonpath_forward [%s] (true|false): " "$gen_pypath" >&2
+    read -r ans; [ -n "$ans" ] && gen_pypath="$ans"
+    printf "latex [%s] (true|false): " "$gen_latex" >&2
+    read -r ans; [ -n "$ans" ] && gen_latex="$ans"
+    printf "python_sci [%s] (true|false): " "$gen_python_sci" >&2
+    read -r ans; [ -n "$ans" ] && gen_python_sci="$ans"
+    printf "ollama [%s] (true|false): " "$gen_ollama" >&2
+    read -r ans; [ -n "$ans" ] && gen_ollama="$ans"
+  fi
+
+  capabilities_validate_value gpu                "$gen_gpu"
+  capabilities_validate_value network_mode       "$gen_network"
+  capabilities_validate_value pythonpath_forward "$gen_pypath"
+  capabilities_validate_value latex              "$gen_latex"
+  capabilities_validate_value python_sci         "$gen_python_sci"
+  capabilities_validate_value ollama             "$gen_ollama"
+
+  local content
+  content="# capabilities.conf — see README (\"Capability contract\").
+# Generated by: claude-docker.sh --generate-capabilities
+version: 1
+gpu: $gen_gpu
+network_mode: $gen_network
+pythonpath_forward: $gen_pypath
+latex: $gen_latex
+python_sci: $gen_python_sci
+ollama: $gen_ollama"
+
+  if [ -n "$output_file" ]; then
+    printf '%s\n' "$content" > "$output_file"
+    echo "Wrote $output_file" >&2
+  else
+    printf '%s\n' "$content"
+  fi
+}
+
 CLAUDE_CONTAINER_NAME="${CLAUDE_CONTAINER_NAME:-claude-worker}"
 CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/claude-projects}"
 # Default under $HOME so /workspace/dispatch survives host reboot. /tmp is
@@ -28,8 +303,26 @@ ENV_FILE=""
 NAME_EXPLICIT=false
 EXTRA_ENV_FLAGS=()
 EXTRA_VOLUME_FLAGS=()
+AUTO_MODE=false
+CAPABILITIES_FILE=""
+CAPABILITIES_FILE_EXPLICIT=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --auto)               AUTO_MODE=true; shift ;;
+    --capabilities-file)
+      if [ -z "${2:-}" ]; then
+        echo "ERROR: --capabilities-file requires a value" >&2
+        exit 2
+      fi
+      CAPABILITIES_FILE="$2"
+      CAPABILITIES_FILE_EXPLICIT=true
+      shift 2
+      ;;
+    --generate-capabilities)
+      shift
+      capabilities_generate "$@"
+      exit 0
+      ;;
     --name)
       if [ -z "${2:-}" ]; then
         echo "ERROR: --name requires a value" >&2
@@ -74,6 +367,43 @@ while [[ $# -gt 0 ]]; do
 Usage: claude-docker.sh [OPTIONS]
 
 Run Claude Code in a Docker container with Python environment support.
+
+Capability contract (evolvix#931):
+  Since #931 the launcher runs in one of two mutually exclusive modes.
+  --stop and --status are unaffected.
+
+  --auto                Auto-detect GPU / network / PYTHONPATH from the host —
+                        the pre-#931 behaviour. Deterministic across hosts is
+                        NOT guaranteed. Use for one-off runs or during migration.
+  (default)             Contract mode. Reads capabilities.conf in the current
+                        directory (override with --capabilities-file). The file
+                        MUST declare `version:` and every capability it uses
+                        (unknown keys → error, unsupported version → error,
+                        missing version → error, requested-but-unavailable
+                        capability → error naming what's missing).
+                        No file + no --auto → error. Both → error.
+
+  --capabilities-file FILE
+                        Read capabilities from FILE instead of ./capabilities.conf.
+  --generate-capabilities [--output FILE] [--interactive]
+                        [--gpu=VAL] [--network-mode=VAL] [--pythonpath-forward=BOOL]
+                        [--latex] [--python-sci] [--ollama]
+                        Emit a valid capabilities.conf. Prints to stdout unless
+                        --output is given. --interactive prompts for each key.
+                        This CLI is the reference implementation of the format.
+
+  Capability values (v1):
+    version              1
+    gpu                  none | nvidia | nvidia-runtime | nvidia-passthrough
+                         | amd | intel                            [default: none]
+    network_mode         host | bridge | none                     [default: bridge]
+    pythonpath_forward   true | false                             [default: false]
+    latex                true | false  (requires overlay image)   [default: false]
+    python_sci           true | false  (requires overlay image)   [default: false]
+    ollama               true | false  (requires overlay image)   [default: false]
+
+  Deferred / not v1: cuda toolkit, ssh forwarding, host `gh` passthrough
+  (currently unconditional — file an issue if this needs a capability).
 
 Environment modes:
   --link_environment    (default) Mount host Python site-packages into the
@@ -156,6 +486,35 @@ HELP
     *) shift ;;
   esac
 done
+
+# ── Mode resolution (evolvix#931) ────────────────────────────────────
+# Contract mode vs --auto vs error. --stop/--status skip this entirely
+# (they don't start a container).
+if [ "$STOP_MODE" != true ] && [ "$STATUS_MODE" != true ]; then
+  if [ -z "$CAPABILITIES_FILE" ]; then
+    CAPABILITIES_FILE="$PWD/capabilities.conf"
+  fi
+  if [ "$AUTO_MODE" = true ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = true ]; then
+    echo "ERROR: --auto and --capabilities-file are mutually exclusive." >&2
+    exit 2
+  fi
+  if [ "$AUTO_MODE" = true ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = false ]; then
+    echo "ERROR: --auto passed but a capabilities.conf is present at $CAPABILITIES_FILE." >&2
+    echo "       These are mutually exclusive. Remove the file, or drop --auto." >&2
+    exit 2
+  fi
+  if [ "$AUTO_MODE" = false ] && [ ! -f "$CAPABILITIES_FILE" ]; then
+    echo "ERROR: no capabilities.conf found at $CAPABILITIES_FILE." >&2
+    echo "       Pass --auto to use host auto-detection (previous behaviour)," >&2
+    echo "       or generate a config: claude-docker.sh --generate-capabilities --output capabilities.conf" >&2
+    echo "       See README (\"Capability contract\") for the format." >&2
+    exit 2
+  fi
+  if [ "$AUTO_MODE" = false ]; then
+    echo "==> Reading capabilities: $CAPABILITIES_FILE"
+    capabilities_parse "$CAPABILITIES_FILE"
+  fi
+fi
 
 # Handle worker lifecycle subcommands before any setup or image build.
 if [ "$STOP_MODE" = true ]; then
@@ -364,27 +723,36 @@ if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
 fi
 
 GPU_FLAG=""
-if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
-  GPU_FLAG="--gpus all"
-  echo "==> GPU: NVIDIA (nvidia container runtime)"
-else
-  for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+if [ "$AUTO_MODE" = true ]; then
+  # --auto path: preserve the pre-#931 auto-detection byte-equivalent.
+  if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
+    GPU_FLAG="--gpus all"
+    echo "==> GPU: NVIDIA (nvidia container runtime)"
+  else
+    for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+      [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
+    done
+    if [ -n "$GPU_FLAG" ]; then
+      echo "==> GPU: NVIDIA (device passthrough)"
+      echo "    Tip: install nvidia-container-toolkit for full GPU support:"
+      echo "         $(dirname "${BASH_SOURCE[0]}")/setup-gpu.sh"
+    fi
+  fi
+  for dev in /dev/dri/renderD*; do
     [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
   done
-  if [ -n "$GPU_FLAG" ]; then
-    echo "==> GPU: NVIDIA (device passthrough)"
-    echo "    Tip: install nvidia-container-toolkit for full GPU support:"
-    echo "         $(dirname "${BASH_SOURCE[0]}")/setup-gpu.sh"
+  if [ -c /dev/kfd ]; then
+    GPU_FLAG="$GPU_FLAG --device /dev/kfd"
   fi
+  [ -n "$(echo "$GPU_FLAG" | grep -o '/dev/dri\|/dev/kfd')" ] && echo "==> GPU: AMD/Intel (DRI render nodes)"
+else
+  # Contract mode: apply the requested GPU capability, error if the host
+  # can't satisfy it. Also validate overlay labels on the image.
+  capabilities_apply_gpu
+  capabilities_check_overlay latex      claude.overlay.latex
+  capabilities_check_overlay python_sci claude.overlay.python-sci
+  capabilities_check_overlay ollama     claude.overlay.ollama
 fi
-
-for dev in /dev/dri/renderD*; do
-  [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
-done
-if [ -c /dev/kfd ]; then
-  GPU_FLAG="$GPU_FLAG --device /dev/kfd"
-fi
-[ -n "$(echo "$GPU_FLAG" | grep -o '/dev/dri\|/dev/kfd')" ] && echo "==> GPU: AMD/Intel (DRI render nodes)"
 
 # ── Build env-specific docker flags ──────────────────────────────────
 ENV_MOUNTS=""
@@ -436,7 +804,13 @@ CUDA_MOUNT=""
 # (project, main repo, host venv) are skipped to avoid double-mount.
 PYTHONPATH_MOUNTS=""
 PYTHONPATH_IN_CONTAINER=""
-if [ -n "${PYTHONPATH:-}" ]; then
+# Contract mode with pythonpath_forward:false must NOT forward the host's
+# PYTHONPATH — the whole point of the contract is host-independent
+# containers (evolvix#931). --auto (or contract with forward:true) keeps
+# the pre-#931 auto-forward.
+if [ "$AUTO_MODE" = false ] && [ "${CAP_pythonpath_forward:-false}" != "true" ]; then
+  :  # skip
+elif [ -n "${PYTHONPATH:-}" ]; then
   _SEEN=""
   while IFS= read -r entry; do
     [ -z "$entry" ] && continue
@@ -491,6 +865,23 @@ if [ "$DAEMON_MODE" = true ]; then
   DISPATCH_MOUNTS="-v $CLAUDE_PROJECTS_DIR:/workspace/projects"
 fi
 
+# ── Network flag ─────────────────────────────────────────────────────
+# --auto reproduces pre-#931 behaviour: interactive gets --network host,
+# daemon defaults to bridge. Contract mode applies CAP_network_mode
+# uniformly to both paths (default `bridge`, so an interactive user who
+# relies on `localhost` MUST set `network_mode: host` in the config —
+# breaking change on day 1, documented in README).
+NETWORK_FLAG_INTERACTIVE=""
+NETWORK_FLAG_DAEMON=""
+if [ "$AUTO_MODE" = true ]; then
+  NETWORK_FLAG_INTERACTIVE="--network host"
+  NETWORK_FLAG_DAEMON=""
+else
+  capabilities_apply_network
+  NETWORK_FLAG_INTERACTIVE="$NETWORK_FLAG"
+  NETWORK_FLAG_DAEMON="$NETWORK_FLAG"
+fi
+
 if [ "$DAEMON_MODE" = true ]; then
   # Seed hasTrustDialogAccepted for each project's IN-CONTAINER worktree path
   # so dispatched agents get their .claude/settings.local.json permission grants
@@ -525,6 +916,7 @@ if [ "$DAEMON_MODE" = true ]; then
     --restart unless-stopped \
     --init \
     --add-host=host.docker.internal:host-gateway \
+    $NETWORK_FLAG_DAEMON \
     $GPU_FLAG \
     -v "$HOME/.claude":/home/node/.claude \
     -v "$HOME/.claude":"$HOME/.claude" \
@@ -614,7 +1006,7 @@ fi
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
 exec docker run -it --rm \
   --name "$INTERACTIVE_NAME" \
-  --network host \
+  $NETWORK_FLAG_INTERACTIVE \
   $GPU_FLAG \
   -v "$PROJECT_DIR":"$PROJECT_DIR" \
   $MAIN_REPO_MOUNT \

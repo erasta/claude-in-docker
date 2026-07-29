@@ -5,6 +5,10 @@ FROM texlive/texlive:latest AS tex
 
 FROM claude-code-env
 
+# Overlay marker — the launcher requires this when capabilities.conf sets
+# latex: true (evolvix#931).
+LABEL claude.overlay.latex=1
+
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
