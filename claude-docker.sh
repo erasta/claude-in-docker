@@ -637,6 +637,37 @@ PYGEN
   fi
 }
 
+# capabilities_install — write a minimal ./claude-docker-capabilities.conf in
+# CWD (evolvix#954). Create-if-absent; --force to overwrite an existing file.
+# Refuses loudly (never silently) when the target exists without --force. This
+# is the bootstrap step for a new project directory: `claude-docker.sh --install`
+# drops a valid, minimal, evolvix-unaware capabilities file the operator can
+# then edit.
+capabilities_install() {
+  local force=false
+  local target="$PWD/claude-docker-capabilities.conf"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      *)
+        echo "ERROR: --install: unknown argument: $1" >&2
+        echo "       Usage: claude-docker.sh --install [--force]" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [ -f "$target" ] && [ "$force" = false ]; then
+    echo "ERROR: $target already exists — refusing to overwrite silently." >&2
+    echo "       Re-run with --force to overwrite." >&2
+    exit 2
+  fi
+  # Reuse the generator (single source of truth for the schema comments +
+  # commented option references, evolvix#952 4a) with defaults. No resources,
+  # no compose_files — those are project-specific; the operator adds them.
+  capabilities_generate --output "$target"
+  echo "Wrote $target"
+}
+
 # capabilities_help — print the schema reference for `capabilities:` (evolvix#952).
 # One place operators can go to see every option, its accepted values, and its
 # effect — instead of reading the launcher script. Keep this in sync with the
@@ -666,15 +697,19 @@ capabilities:
 
 compose_files:                            # OPTIONAL — top-level list of docker
                                           # compose files --daemon brings up
-                                          # BEFORE the worker (evolvix#952 4c).
+                                          # BEFORE the worker. BACKENDS ONLY —
+                                          # the worker container is launched by
+                                          # claude-docker's own docker-run under
+                                          # --name and MUST NOT appear in any of
+                                          # these files (evolvix#954).
                                           # Ordered; idempotent (skips a file
                                           # whose services are already running).
                                           # Compose project name comes from the
                                           # file itself (top-level `name:` or
                                           # compose's parent-dir default) —
                                           # launcher NEVER invents one.
-  - ${EVOLVIX_ROOT}/docker-compose.yml
-  - ~/.evolvix/compose/workers/evolvix.yml
+  - ./backends.yml
+  - ./dependencies.yml
 
 resources:                                # OPEN-ENDED — add one entry per host
                                           # capability the container needs
@@ -744,6 +779,12 @@ while [[ $# -gt 0 ]]; do
     --generate-capabilities)
       shift
       capabilities_generate "$@"
+      exit 0
+      ;;
+    --install)
+      # evolvix#954: bootstrap a minimal ./claude-docker-capabilities.conf.
+      shift
+      capabilities_install "$@"
       exit 0
       ;;
     --help-capabilities)
@@ -829,6 +870,9 @@ Capability contract (evolvix#931, reshaped by #935):
   --help-capabilities   Print the schema reference for `capabilities:` — every
                         option, its accepted values, and its effect. One place
                         to look instead of reading this script (evolvix#952).
+  --install [--force]   Write a minimal ./claude-docker-capabilities.conf in
+                        CWD. Create-if-absent; --force to overwrite an existing
+                        file. Refuses (loudly) otherwise (evolvix#954).
 
   Format (v1 rewrite, #935):
     version: 1
@@ -947,53 +991,44 @@ done
 # Contract mode vs --auto vs error. --stop/--status skip this entirely
 # (they don't start a container).
 if [ "$STOP_MODE" != true ] && [ "$STATUS_MODE" != true ]; then
-  # Filename resolution (evolvix#952):
-  #   1. --capabilities-file explicit path (highest)
-  #   2. $PWD/claude-docker-capabilities.conf  (new canonical name)
-  #   3. $PWD/capabilities.conf                (DEPRECATED — one release fallback)
-  #   4. ~/.evolvix/claude-docker-capabilities.conf (Evolvix-generated default)
-  # `capabilities.conf` names the format, not its consumer; the new name
-  # ("claude-docker-capabilities.conf") tells you what reads it in a repo
-  # that has several kinds of config. The old name works for one release
-  # so operators with a hand-written file on disk aren't broken.
-  if [ -z "$CAPABILITIES_FILE" ]; then
-    if [ -f "$PWD/claude-docker-capabilities.conf" ]; then
-      CAPABILITIES_FILE="$PWD/claude-docker-capabilities.conf"
-    elif [ -f "$PWD/capabilities.conf" ]; then
-      CAPABILITIES_FILE="$PWD/capabilities.conf"
-      echo "WARNING: reading '$CAPABILITIES_FILE' — the file has been renamed to" >&2
-      echo "         'claude-docker-capabilities.conf' (evolvix#952). Rename or" >&2
-      echo "         regenerate with:" >&2
-      echo "           mv capabilities.conf claude-docker-capabilities.conf" >&2
-      echo "         The old name will stop being read one release after #952." >&2
-    elif [ -f "$HOME/.evolvix/claude-docker-capabilities.conf" ]; then
-      CAPABILITIES_FILE="$HOME/.evolvix/claude-docker-capabilities.conf"
-    else
-      CAPABILITIES_FILE="$PWD/claude-docker-capabilities.conf"
-    fi
+  # Capability resolution — strict precedence (evolvix#954):
+  #   1. explicit --capabilities-file <path>
+  #   2. ./claude-docker-capabilities.conf in CWD
+  #   3. none → bare container (no capabilities applied)
+  # claude-docker reads from CWD only — NEVER from any host-specific location
+  # under $HOME. If you want a config, either pass it explicitly or `cd` into a
+  # dir containing one. No magic per-host defaults.
+  if [ -z "$CAPABILITIES_FILE" ] && [ -f "$PWD/claude-docker-capabilities.conf" ]; then
+    CAPABILITIES_FILE="$PWD/claude-docker-capabilities.conf"
   fi
-  if [ "$AUTO_MODE" = true ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = true ]; then
+  if [ "$AUTO_MODE" = true ] && [ -n "$CAPABILITIES_FILE" ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = true ]; then
     echo "ERROR: --auto and --capabilities-file are mutually exclusive." >&2
     exit 2
   fi
-  if [ "$AUTO_MODE" = true ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = false ]; then
+  if [ "$AUTO_MODE" = true ] && [ -n "$CAPABILITIES_FILE" ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = false ]; then
     echo "ERROR: --auto passed but a capabilities file is present at $CAPABILITIES_FILE." >&2
     echo "       These are mutually exclusive. Remove the file, or drop --auto." >&2
     exit 2
   fi
-  if [ "$AUTO_MODE" = false ] && [ ! -f "$CAPABILITIES_FILE" ]; then
-    echo "ERROR: no capabilities file found. Looked at (in order):" >&2
-    echo "         \$PWD/claude-docker-capabilities.conf" >&2
-    echo "         \$PWD/capabilities.conf   (deprecated fallback)" >&2
-    echo "         \$HOME/.evolvix/claude-docker-capabilities.conf   (Evolvix default)" >&2
-    echo "       Pass --auto to use host auto-detection (previous behaviour)," >&2
-    echo "       or generate: claude-docker.sh --generate-capabilities --output claude-docker-capabilities.conf" >&2
-    echo "       See README (\"Capability contract\") for the format." >&2
+  if [ "$AUTO_MODE" = false ] && [ -n "$CAPABILITIES_FILE" ] && [ ! -f "$CAPABILITIES_FILE" ]; then
+    # Explicit --capabilities-file that doesn't exist → error. This is different
+    # from precedence step 3 (no flag, no CWD file → run bare); an explicit path
+    # that doesn't resolve is a fail-loud typo, not a fall-through.
+    echo "ERROR: capabilities file not found: $CAPABILITIES_FILE" >&2
     exit 2
   fi
-  if [ "$AUTO_MODE" = false ]; then
+  if [ "$AUTO_MODE" = false ] && [ -n "$CAPABILITIES_FILE" ]; then
     echo "==> Reading capabilities: $CAPABILITIES_FILE"
     capabilities_parse "$CAPABILITIES_FILE"
+  elif [ "$AUTO_MODE" = false ] && [ -z "$CAPABILITIES_FILE" ]; then
+    # Precedence step 3: no flag, no CWD file. Run bare — set safe defaults
+    # so the apply_ functions below don't dereference unset CAP_* vars.
+    echo "==> No capabilities file — running bare (no GPU, docker default network, link mode, no resources)"
+    CAP_gpu="none"
+    CAP_network_mode="bridge"
+    CAP_python_mode="link"
+    RES_NAMES=""
+    COMPOSE_FILES=""
   fi
 fi
 
@@ -1029,24 +1064,59 @@ if [ -n "$ENV_FILE" ]; then
   ENV_FILE_FLAG="--env-file $ENV_FILE"
 fi
 
-# --daemon: bring up any compose_files first (evolvix#952 4c), then check for
-# an existing worker. compose_files come first so backends are up before we
-# even consider whether the worker exists — if the worker file was listed in
-# compose_files, its container is already created by compose-up, and the next
-# block's "already running" check exits cleanly. If the worker wasn't in
-# compose_files (or compose_files was empty), the docker-run below creates it.
+# --daemon: order is (evolvix#954):
+#   1. Snapshot pre-invocation state of the worker container: running |
+#      stopped | absent. Doing this BEFORE compose_files runs is what prevents
+#      a compose-up from masquerading as a pre-existing worker.
+#   2. Bring up compose_files (BACKENDS ONLY — the worker container MUST NOT
+#      appear as a service in any of these files; see the contract on
+#      capabilities_apply_compose_files).
+#   3. Dispatch on the snapshot:
+#        running → exit 0 (pre-existing, respect it)
+#        stopped → docker rm -f (clean up a crashed prior run), fall through
+#        absent  → if a container by that name exists NOW, compose_files
+#                  created it — REFUSE (backends-only contract violated). The
+#                  worker must be launched by claude-docker's own docker-run
+#                  under --name.
+if [ "$DAEMON_MODE" = true ]; then
+  WORKER_STATE="absent"
+  if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
+    WORKER_STATE="running"
+  elif docker ps -a --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
+    WORKER_STATE="stopped"
+  fi
+fi
 if [ "$DAEMON_MODE" = true ] && [ "$AUTO_MODE" = false ]; then
   # --auto mode has no COMPOSE_FILES (capabilities parsing was skipped).
   capabilities_apply_compose_files
 fi
 if [ "$DAEMON_MODE" = true ]; then
-  if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
-    echo "Claude worker already running (container: $CLAUDE_CONTAINER_NAME)"
-    docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format 'Status: {{.Status}}'
-    exit 0
-  fi
-  # Clear any stopped container carrying the same name so `docker run` succeeds.
-  docker rm -f "$CLAUDE_CONTAINER_NAME" >/dev/null 2>&1 || true
+  case "$WORKER_STATE" in
+    running)
+      echo "Claude worker already running (container: $CLAUDE_CONTAINER_NAME)"
+      docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format 'Status: {{.Status}}'
+      exit 0
+      ;;
+    stopped)
+      # Pre-existing stopped container from an earlier run — safe to clear.
+      docker rm -f "$CLAUDE_CONTAINER_NAME" >/dev/null 2>&1 || true
+      ;;
+    absent)
+      # No container by that name existed BEFORE this invocation. If one
+      # exists NOW, compose_files created it — the backends-only contract was
+      # violated. Refuse loudly (evolvix#954 3).
+      if docker ps -a --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
+        echo "ERROR: a container named '$CLAUDE_CONTAINER_NAME' was created by" >&2
+        echo "       compose_files. That violates the contract: compose_files is for" >&2
+        echo "       BACKEND / dependency services only — the worker container is" >&2
+        echo "       launched by claude-docker.sh's own docker-run under --name." >&2
+        echo "       Remove any service that declares" >&2
+        echo "         container_name: $CLAUDE_CONTAINER_NAME" >&2
+        echo "       from the compose files listed in your capabilities file." >&2
+        exit 2
+      fi
+      ;;
+  esac
   mkdir -p "$CLAUDE_PROJECTS_DIR" "$CLAUDE_DISPATCH_DIR"
 fi
 
