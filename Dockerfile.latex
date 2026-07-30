@@ -1,0 +1,21 @@
+# LaTeX overlay — copies TeX Live 2026 from the official CTAN image on top
+# of an already-built claude-code-env. Runs `make docker-add-latex` after
+# `make docker-build`.
+FROM texlive/texlive:latest AS tex
+
+FROM claude-code-env
+
+# Overlay marker — the launcher requires this when capabilities.conf sets
+# latex: true (evolvix#931).
+LABEL claude.overlay.latex=1
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        perl fontconfig \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=tex /usr/local/texlive /usr/local/texlive
+
+USER node
+ENV PATH=/usr/local/texlive/2026/bin/x86_64-linux:${PATH}

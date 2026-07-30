@@ -1,0 +1,480 @@
+#!/bin/bash
+# tests/test_capabilities.sh — exercises the capability contract as reshaped
+# by evolvix#935 (v1 rewrite: `capabilities:` block + open-ended `resources:`).
+#
+# Runs against a real `claude-docker.sh` in a temp cwd so a real
+# capabilities.conf never leaks in. Nothing here starts a container.
+#
+# Run: bash tests/test_capabilities.sh
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+CLAUDE="$SCRIPT_DIR/claude-docker.sh"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+pass=0
+fail=0
+
+assert_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+    echo "  PASS: $label"
+    pass=$((pass + 1))
+  else
+    echo "  FAIL: $label"
+    echo "    expected substring: $needle"
+    echo "    got: $(printf '%s' "$haystack" | head -c 800)"
+    echo
+    fail=$((fail + 1))
+  fi
+}
+
+assert_rc() {
+  local label="$1" expected="$2" got="$3"
+  if [ "$got" -eq "$expected" ]; then
+    echo "  PASS: $label (rc=$got)"
+    pass=$((pass + 1))
+  else
+    echo "  FAIL: $label (expected rc=$expected, got rc=$got)"
+    fail=$((fail + 1))
+  fi
+}
+
+run_launcher() {
+  local workdir="$1"; shift
+  ( cd "$workdir" && "$CLAUDE" "$@" ) 2>&1
+}
+
+echo "=== 1. No config + no --auto → run bare (evolvix#954) ==="
+# Contract: (1) --capabilities-file, (2) ./claude-docker-capabilities.conf, (3)
+# none → bare container. Not fail-closed anymore; a missing config is a valid
+# state (run with defaults). Force HOME to /nonexistent so we prove the
+# launcher never falls back to any $HOME location.
+mkdir -p "$TMP/empty"
+out=$(HOME="/nonexistent/host/dir" run_launcher "$TMP/empty" --update_environment 2>&1) || true
+assert_contains "runs bare when no config present" "running bare" "$out"
+# Fail-loud only if --capabilities-file was explicit and points at a missing file:
+out2=$(run_launcher "$TMP/empty" --capabilities-file "/nonexistent/path.conf" --update_environment 2>&1) || true
+assert_contains "explicit missing --capabilities-file → error" "capabilities file not found" "$out2"
+
+echo "=== 2. --auto + config present → mutually-exclusive error ==="
+mkdir -p "$TMP/both"
+cat > "$TMP/both/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+CONF
+out=$(run_launcher "$TMP/both" --auto 2>&1) || true
+assert_contains "mutually-exclusive error" "mutually exclusive" "$out"
+
+echo "=== 3. Missing version → error ==="
+mkdir -p "$TMP/noversion"
+cat > "$TMP/noversion/claude-docker-capabilities.conf" <<'CONF'
+capabilities:
+  gpu: none
+CONF
+out=$(run_launcher "$TMP/noversion" 2>&1) || true
+assert_contains "missing version → error" "missing required 'version'" "$out"
+
+echo "=== 4. Unsupported version → error, no default ==="
+mkdir -p "$TMP/badver"
+cat > "$TMP/badver/claude-docker-capabilities.conf" <<'CONF'
+version: 99
+capabilities:
+  gpu: none
+CONF
+out=$(run_launcher "$TMP/badver" 2>&1) || true
+assert_contains "unsupported version → error" "unsupported version '99'" "$out"
+
+echo "=== 5. Unknown top-level key → error ==="
+mkdir -p "$TMP/unknown_top"
+cat > "$TMP/unknown_top/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+totally_fake_top: hello
+CONF
+out=$(run_launcher "$TMP/unknown_top" 2>&1) || true
+assert_contains "unknown top-level key → error" "unknown top-level key 'totally_fake_top'" "$out"
+
+echo "=== 6. Unknown key under capabilities: → error ==="
+mkdir -p "$TMP/unknown_cap"
+cat > "$TMP/unknown_cap/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+  fantasy_key: hello
+CONF
+out=$(run_launcher "$TMP/unknown_cap" 2>&1) || true
+assert_contains "unknown capability key → error" "unknown key 'fantasy_key' under 'capabilities:'" "$out"
+
+echo "=== 7. Invalid value for enum → error ==="
+mkdir -p "$TMP/badval"
+cat > "$TMP/badval/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: fantasy_gpu
+CONF
+out=$(run_launcher "$TMP/badval" 2>&1) || true
+assert_contains "invalid enum value → error" "capabilities.gpu: invalid value 'fantasy_gpu'" "$out"
+
+echo "=== 8. Malformed line → error ==="
+mkdir -p "$TMP/mal"
+cat > "$TMP/mal/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+this line has no colon
+CONF
+out=$(run_launcher "$TMP/mal" 2>&1) || true
+assert_contains "malformed line → error" "expected 'key: value' or 'key:'" "$out"
+
+echo "=== 9. Generator: byte-identical output for identical inputs ==="
+out1=$("$CLAUDE" --generate-capabilities --gpu=nvidia --network-mode=host --python-mode=link \
+  --resource "github:cli=gh,mount=/tmp:/tmp:ro,env=GH_TOKEN" 2>&1)
+out2=$("$CLAUDE" --generate-capabilities --gpu=nvidia --network-mode=host --python-mode=link \
+  --resource "github:cli=gh,mount=/tmp:/tmp:ro,env=GH_TOKEN" 2>&1)
+if [ "$out1" = "$out2" ]; then
+  echo "  PASS: byte-identical generator output"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: generator output diverges between calls"
+  fail=$((fail + 1))
+fi
+
+echo "=== 10. Generator: rejects invalid enum ==="
+out=$("$CLAUDE" --generate-capabilities --gpu=fantasy 2>&1) && rc=0 || rc=$?
+assert_contains "generator rejects bad --gpu" "invalid value 'fantasy'" "$out"
+assert_rc "generator exit code" 2 "$rc"
+
+echo "=== 11. Generator → parser round-trip (a resource the launcher has never seen) ==="
+gen="$TMP/roundtrip"
+mkdir -p "$gen"
+# `huggingface` is a name the launcher does not recognise — that's the point.
+"$CLAUDE" --generate-capabilities --gpu=none --network-mode=bridge --python-mode=copy \
+  --resource "huggingface:cli=bash,mount=/tmp:/root/.cache/hf,env=HF_TOKEN" \
+  --output "$gen/claude-docker-capabilities.conf" 2>/dev/null
+out=$(run_launcher "$gen" 2>&1) || true
+# The launcher gets past parsing; if the parser rejected it we'd see one of these:
+if printf '%s' "$out" | grep -qE "unknown top-level key|unknown key|unsupported version|missing required|invalid value|malformed line"; then
+  echo "  FAIL: parser rejected the generator's output"
+  echo "    got: $(printf '%s' "$out" | head -c 800)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: parser accepts an unknown-to-launcher resource end-to-end"
+  pass=$((pass + 1))
+fi
+# Also confirm the resource was applied (message shows it processed the resource)
+assert_contains "resource applied (huggingface)" "Resource: huggingface" "$out"
+
+echo "=== 12. Mount source missing → error naming the path ==="
+mkdir -p "$TMP/missing_mount"
+cat > "$TMP/missing_mount/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+resources:
+  x:
+    mounts:
+      - /this/path/does/not/exist:/somewhere
+CONF
+out=$(run_launcher "$TMP/missing_mount" 2>&1) || true
+assert_contains "missing mount → error naming path" "mount source not found on host: /this/path/does/not/exist" "$out"
+
+echo "=== 13. Declared cli missing on host PATH → error naming binary ==="
+mkdir -p "$TMP/missing_cli"
+cat > "$TMP/missing_cli/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+resources:
+  x:
+    cli: definitely_not_installed_binary_xyz
+CONF
+out=$(run_launcher "$TMP/missing_cli" 2>&1) || true
+assert_contains "missing cli → error naming binary" "cli 'definitely_not_installed_binary_xyz' not found on host PATH" "$out"
+
+echo "=== 14. env values with '=' rejected (names only, not literals) ==="
+mkdir -p "$TMP/env_leak"
+cat > "$TMP/env_leak/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+resources:
+  x:
+    env:
+      - HF_TOKEN=leaked_secret
+CONF
+out=$(run_launcher "$TMP/env_leak" 2>&1) || true
+assert_contains "env values rejected — names only" "env\` items are NAMES only" "$out"
+
+echo "=== 15. mount path expands \${VAR} at parse time ==="
+export TEST_HOST_PATH=/tmp
+mkdir -p "$TMP/varsub"
+cat > "$TMP/varsub/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+resources:
+  x:
+    mounts:
+      - ${TEST_HOST_PATH}:/mounted
+CONF
+out=$(run_launcher "$TMP/varsub" 2>&1) || true
+assert_contains "\${VAR} expanded in mount" "mount  /tmp:/mounted" "$out"
+unset TEST_HOST_PATH
+
+echo "=== 16. resources: absent → no resources applied, no error ==="
+mkdir -p "$TMP/no_resources"
+cat > "$TMP/no_resources/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+CONF
+out=$(run_launcher "$TMP/no_resources" 2>&1) || true
+# No error message about resources
+if printf '%s' "$out" | grep -q "no capabilities file found\|malformed\|unknown key\|unsupported version"; then
+  echo "  FAIL: parser errored on no-resources config"
+  echo "    got: $(printf '%s' "$out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: resources: absent is legal"
+  pass=$((pass + 1))
+fi
+
+echo "=== 17. --help mentions the new shape ==="
+out=$("$CLAUDE" --help 2>&1)
+assert_contains "help mentions capability contract" "Capability contract" "$out"
+assert_contains "help mentions resources:" "resources:" "$out"
+assert_contains "help mentions --resource generator flag" "--resource" "$out"
+assert_contains "help mentions --python-mode" "python_mode" "$out"
+assert_contains "help documents names-only rule" "NAMES only" "$out"
+
+echo "=== 18. --generate-capabilities annotates every option (evolvix#952) ==="
+out=$("$CLAUDE" --generate-capabilities 2>&1)
+assert_contains "generate: help pointer" "--help-capabilities" "$out"
+assert_contains "generate: gpu option commented" "# gpu: nvidia | dri | kfd | none" "$out"
+assert_contains "generate: gpu nvidia effect" "requires nvidia runtime" "$out"
+assert_contains "generate: network_mode option commented" "# network_mode: host | bridge | none" "$out"
+assert_contains "generate: python_mode option commented" "# python_mode: link | copy" "$out"
+# Generated file must still parse cleanly against the launcher's own parser.
+tmp_gen="$TMP/generated"
+mkdir -p "$tmp_gen"
+"$CLAUDE" --generate-capabilities --output "$tmp_gen/claude-docker-capabilities.conf" >/dev/null 2>&1
+parse_out=$(run_launcher "$tmp_gen" 2>&1) || true
+if printf '%s' "$parse_out" | grep -q "unknown key\|malformed\|unsupported version\|ERROR:"; then
+  echo "  FAIL: parser rejected generator output (self-round-trip broken)"
+  echo "    got: $(printf '%s' "$parse_out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: generator output round-trips through parser"
+  pass=$((pass + 1))
+fi
+
+echo "=== 20. new filename claude-docker-capabilities.conf is preferred (evolvix#952) ==="
+mkdir -p "$TMP/newname"
+cat > "$TMP/newname/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+CONF
+out=$(HOME="$TMP/empty_home_a" run_launcher "$TMP/newname" 2>&1) || true
+assert_contains "reads new name" "Reading capabilities: $TMP/newname/claude-docker-capabilities.conf" "$out"
+
+echo "=== 21. explicit --capabilities-file overrides CWD (evolvix#954 precedence 1) ==="
+mkdir -p "$TMP/prec_cwd" "$TMP/prec_flag"
+cat > "$TMP/prec_cwd/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+CONF
+cat > "$TMP/prec_flag/explicit.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+  network_mode: none
+CONF
+# CWD has a file, but --capabilities-file wins. Verify the explicit path is read.
+out=$(HOME="/nonexistent/host/dir" run_launcher "$TMP/prec_cwd" \
+       --capabilities-file "$TMP/prec_flag/explicit.conf" --update_environment 2>&1) || true
+assert_contains "explicit --capabilities-file wins over CWD" \
+                "Reading capabilities: $TMP/prec_flag/explicit.conf" "$out"
+
+echo "=== 22. \$HOME/.evolvix NEVER consulted (evolvix#954 contract) ==="
+# Create a file at $HOME/.evolvix/claude-docker-capabilities.conf and verify the
+# launcher does NOT pick it up when CWD has no config. The contract is:
+# claude-docker is evolvix-unaware; no host-specific fallback.
+mkdir -p "$TMP/fake_home_dotev/.evolvix"
+cat > "$TMP/fake_home_dotev/.evolvix/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: nvidia
+CONF
+mkdir -p "$TMP/empty_cwd_v2"
+out=$(HOME="$TMP/fake_home_dotev" run_launcher "$TMP/empty_cwd_v2" \
+       --update_environment 2>&1) || true
+# Should run BARE (not read the $HOME/.evolvix file):
+assert_contains "no $HOME fallback — runs bare" "running bare" "$out"
+# And must NOT have read the $HOME file:
+if printf '%s' "$out" | grep -q "Reading capabilities: $TMP/fake_home_dotev"; then
+  echo "  FAIL: launcher read from \$HOME/.evolvix (contract violated)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: launcher did NOT read \$HOME/.evolvix"
+  pass=$((pass + 1))
+fi
+
+echo "=== 24. compose_files: parses as top-level list (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_ok"
+touch "$TMP/cf_ok/backends.yml" "$TMP/cf_ok/worker.yml"
+cat > "$TMP/cf_ok/claude-docker-capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+compose_files:
+  - $TMP/cf_ok/backends.yml
+  - $TMP/cf_ok/worker.yml
+CONF
+# Parse via `capabilities_parse` — needs bash source. Simplest end-to-end check:
+# invoke launcher in a way that reaches parse but stops before docker calls.
+# --update_environment triggers parse but its docker calls happen later.
+out=$(HOME="$TMP/cf_ok_home" run_launcher "$TMP/cf_ok" --update_environment 2>&1) || true
+# Success: no parse error for compose_files
+if printf '%s' "$out" | grep -qE "unknown top-level key|malformed|compose_files.*must be"; then
+  echo "  FAIL: parser rejected valid compose_files"
+  echo "    got: $(printf '%s' "$out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: compose_files: top-level list accepted"
+  pass=$((pass + 1))
+fi
+
+echo "=== 25. compose_files: missing file → parse-time error (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_missing"
+cat > "$TMP/cf_missing/claude-docker-capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+compose_files:
+  - /nonexistent/does-not-exist.yml
+CONF
+out=$(HOME="$TMP/cf_missing_home" run_launcher "$TMP/cf_missing" --update_environment 2>&1) || true
+assert_contains "missing compose file → error" "does not exist on host" "$out"
+
+echo "=== 26. compose_files: not-a-list → parse-time error (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_wrong"
+cat > "$TMP/cf_wrong/claude-docker-capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+compose_files:
+  key: value
+CONF
+out=$(HOME="$TMP/cf_wrong_home" run_launcher "$TMP/cf_wrong" --update_environment 2>&1) || true
+assert_contains "non-list compose_files → error" "compose_files" "$out"
+assert_contains "non-list compose_files → 'must be a list'" "must be a list" "$out"
+
+echo "=== 27. compose_files: absent is legal (no error, no invocation) (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_absent"
+cat > "$TMP/cf_absent/claude-docker-capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+CONF
+out=$(HOME="$TMP/cf_absent_home" run_launcher "$TMP/cf_absent" --update_environment 2>&1) || true
+if printf '%s' "$out" | grep -qE "unknown top-level key|malformed|compose_files"; then
+  echo "  FAIL: absent compose_files errored or invoked"
+  echo "    got: $(printf '%s' "$out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: compose_files: absent is legal"
+  pass=$((pass + 1))
+fi
+
+echo "=== 28. --help-capabilities mentions compose_files (evolvix#952 4c) ==="
+out=$("$CLAUDE" --help-capabilities 2>&1)
+assert_contains "help-cap: compose_files" "compose_files:" "$out"
+assert_contains "help-cap: compose_files rationale" "brings up" "$out"
+assert_contains "help-cap: never invents" "NEVER invents" "$out"
+
+echo "=== 29. --install writes ./claude-docker-capabilities.conf (evolvix#954) ==="
+mkdir -p "$TMP/install_new"
+out=$( ( cd "$TMP/install_new" && "$CLAUDE" --install ) 2>&1) && rc=0 || rc=$?
+assert_rc "install exit 0" 0 "$rc"
+assert_contains "install: reports wrote" "Wrote" "$out"
+if [ -f "$TMP/install_new/claude-docker-capabilities.conf" ]; then
+  echo "  PASS: install: file created in CWD"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: install: expected file at $TMP/install_new/claude-docker-capabilities.conf"
+  fail=$((fail + 1))
+fi
+# The file must be a valid schema (self-round-trip through the parser):
+out=$(run_launcher "$TMP/install_new" --update_environment 2>&1) || true
+if printf '%s' "$out" | grep -qE "unknown top-level key|unknown key|malformed|invalid value|unsupported version"; then
+  echo "  FAIL: install: written file does not parse"
+  echo "    got: $(printf '%s' "$out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: install: written file parses cleanly"
+  pass=$((pass + 1))
+fi
+
+echo "=== 30. --install refuses to clobber existing file (evolvix#954) ==="
+mkdir -p "$TMP/install_exists"
+echo "# hand-crafted" > "$TMP/install_exists/claude-docker-capabilities.conf"
+out=$( ( cd "$TMP/install_exists" && "$CLAUDE" --install ) 2>&1) && rc=0 || rc=$?
+assert_rc "install refuses to overwrite → exit 2" 2 "$rc"
+assert_contains "install: refuses loudly" "already exists" "$out"
+assert_contains "install: hints --force" "--force" "$out"
+# File must be untouched:
+if grep -q "^# hand-crafted$" "$TMP/install_exists/claude-docker-capabilities.conf"; then
+  echo "  PASS: install: existing file untouched (no silent clobber)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: install: existing file was overwritten silently"
+  fail=$((fail + 1))
+fi
+
+echo "=== 31. --install --force overwrites existing file (evolvix#954) ==="
+mkdir -p "$TMP/install_force"
+echo "# hand-crafted" > "$TMP/install_force/claude-docker-capabilities.conf"
+out=$( ( cd "$TMP/install_force" && "$CLAUDE" --install --force ) 2>&1) && rc=0 || rc=$?
+assert_rc "install --force exit 0" 0 "$rc"
+if grep -q "^# hand-crafted$" "$TMP/install_force/claude-docker-capabilities.conf"; then
+  echo "  FAIL: install --force: did not overwrite"
+  fail=$((fail + 1))
+else
+  echo "  PASS: install --force: overwrote existing file"
+  pass=$((pass + 1))
+fi
+
+echo "=== 32. launcher source: zero .evolvix references (evolvix#954 contract) ==="
+count=$(grep -cE "\.evolvix|EVOLVIX_ROOT" "$CLAUDE" || true)
+if [ "$count" -eq 0 ]; then
+  echo "  PASS: zero '.evolvix' / EVOLVIX_ROOT literals in launcher"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: found $count '.evolvix' / EVOLVIX_ROOT references in launcher (must be 0)"
+  grep -nE "\.evolvix|EVOLVIX_ROOT" "$CLAUDE" | head -5
+  fail=$((fail + 1))
+fi
+
+echo "=== 19. --help-capabilities prints schema reference (evolvix#952) ==="
+out=$("$CLAUDE" --help-capabilities 2>&1)
+assert_contains "help-cap: title" "capabilities.conf — schema reference" "$out"
+assert_contains "help-cap: gpu enum" "gpu: nvidia | dri | kfd | none" "$out"
+assert_contains "help-cap: network enum" "network_mode: host | bridge | none" "$out"
+assert_contains "help-cap: python_mode enum" "python_mode: link | copy" "$out"
+assert_contains "help-cap: resources structure" "env_set:" "$out"
+assert_contains "help-cap: mount syntax" "host:container[:ro]" "$out"
+assert_contains "help-cap: --help mentions --help-capabilities" \
+                "--help-capabilities" "$("$CLAUDE" --help 2>&1)"
+
+echo
+echo "=== Summary: $pass passed, $fail failed ==="
+if [ "$fail" -gt 0 ]; then
+  exit 1
+fi

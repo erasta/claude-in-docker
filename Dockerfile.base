@@ -1,0 +1,33 @@
+# Claude Docker base image — minimal essentials only.
+# Adds: node (from base image), claude CLI, git, gh, entrypoint.
+# Deliberately excludes: python3 (bind-mount host venv, or use
+# docker-add-python-sci), texlive (docker-add-latex), ollama.
+#
+# libssl3/libffi8/libsqlite3-0/liblzma5/libbz2-1.0/libgomp1 are the .so
+# runtime deps that host-bind-mounted Python 3.11 stdlib and most
+# scientific wheels link against.
+FROM node:20-trixie
+
+# Declare this as a claude-docker base image. Overlays add their own
+# claude.overlay.<name>=1 labels; the launcher validates a
+# capabilities.conf's requested overlays against these labels (evolvix#931).
+LABEL claude.image=1
+LABEL claude.image.version=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        gh \
+        libssl3 libffi8 libsqlite3-0 liblzma5 libbz2-1.0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+USER node
+ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
+ENV PATH=/home/node/.npm-global/bin:/opt/venv/bin:$PATH
+RUN npm install -g @anthropic-ai/claude-code
+
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["claude", "--dangerously-skip-permissions"]
