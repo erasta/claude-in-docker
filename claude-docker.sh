@@ -1536,6 +1536,25 @@ if [ "$DAEMON_MODE" = true ]; then
     chown -R node:node /workspace >/dev/null 2>&1 || \
     echo "WARN: could not chown /workspace to node:node in $CLAUDE_CONTAINER_NAME" >&2
 
+  # Pre-populate known_hosts for github.com (evolvix#965/#966). Without this,
+  # `git push` over SSH from inside the container fails "Host key verification
+  # failed" (rc=128) because ~/.ssh/known_hosts is empty and SSH's default
+  # StrictHostKeyChecking=ask refuses non-interactively. That failure had
+  # bitten every dispatch's finalize step until each project.yaml added
+  # -o StrictHostKeyChecking=accept-new to its GIT_SSH_COMMAND — a per-project
+  # workaround that this launcher-side fix supersedes.
+  #
+  # ssh-keyscan queries GitHub's live host keys at start; we accept ed25519,
+  # rsa, ecdsa (GitHub publishes all three). Runs as the node user so ~/.ssh
+  # is owned correctly. Chained mkdir + chmod because the base image may not
+  # ship ~/.ssh.
+  docker exec -u node "$CLAUDE_CONTAINER_NAME" bash -c '
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    ssh-keyscan -t ed25519,rsa,ecdsa -T 5 github.com 2>/dev/null > ~/.ssh/known_hosts
+    chmod 600 ~/.ssh/known_hosts
+  ' >/dev/null 2>&1 || \
+    echo "WARN: could not populate github.com known_hosts in $CLAUDE_CONTAINER_NAME" >&2
+
   # In link mode, point /opt/venv at the mounted host venv so the image's
   # baked PATH (/opt/venv/bin first) resolves to the working interpreter.
   # Before this: the 2026-07-18 base/overlay split (commit 6a55d98) dropped
