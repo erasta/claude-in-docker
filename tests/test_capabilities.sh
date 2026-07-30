@@ -48,8 +48,11 @@ run_launcher() {
 
 echo "=== 1. No config + no --auto → fail-closed ==="
 mkdir -p "$TMP/empty"
-out=$(run_launcher "$TMP/empty" --link_environment 2>&1) || true
-assert_contains "error message names capabilities.conf" "no capabilities.conf found" "$out"
+# evolvix#952: force HOME to a scratch dir so the ~/.evolvix/ fallback doesn't
+# pick up an operator's actual generated file and mask the fail-closed path.
+out=$(HOME="$TMP/empty_home" run_launcher "$TMP/empty" --link_environment 2>&1) || true
+assert_contains "error message names capabilities file" "no capabilities file found" "$out"
+assert_contains "error message names new filename" "claude-docker-capabilities.conf" "$out"
 
 echo "=== 2. --auto + config present → mutually-exclusive error ==="
 mkdir -p "$TMP/both"
@@ -225,7 +228,7 @@ capabilities:
 CONF
 out=$(run_launcher "$TMP/no_resources" 2>&1) || true
 # No error message about resources
-if printf '%s' "$out" | grep -q "no capabilities.conf found\|malformed\|unknown key\|unsupported version"; then
+if printf '%s' "$out" | grep -q "no capabilities file found\|malformed\|unknown key\|unsupported version"; then
   echo "  FAIL: parser errored on no-resources config"
   echo "    got: $(printf '%s' "$out" | head -c 500)"
   fail=$((fail + 1))
@@ -262,6 +265,66 @@ else
   echo "  PASS: generator output round-trips through parser"
   pass=$((pass + 1))
 fi
+
+echo "=== 20. new filename claude-docker-capabilities.conf is preferred (evolvix#952) ==="
+mkdir -p "$TMP/newname"
+cat > "$TMP/newname/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+CONF
+out=$(HOME="$TMP/empty_home_a" run_launcher "$TMP/newname" 2>&1) || true
+assert_contains "reads new name" "Reading capabilities: $TMP/newname/claude-docker-capabilities.conf" "$out"
+
+echo "=== 21. old filename capabilities.conf still works — with deprecation WARNING (evolvix#952) ==="
+mkdir -p "$TMP/oldname"
+cat > "$TMP/oldname/capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+CONF
+out=$(HOME="$TMP/empty_home_b" run_launcher "$TMP/oldname" 2>&1) || true
+assert_contains "reads old name" "Reading capabilities: $TMP/oldname/capabilities.conf" "$out"
+assert_contains "warns about deprecation" "renamed to" "$out"
+assert_contains "warning names new file" "claude-docker-capabilities.conf" "$out"
+assert_contains "warning is time-boxed" "one release after" "$out"
+
+echo "=== 22. new filename wins over old when both present (evolvix#952) ==="
+mkdir -p "$TMP/both_names"
+cat > "$TMP/both_names/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+CONF
+cat > "$TMP/both_names/capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: nvidia
+CONF
+out=$(HOME="$TMP/empty_home_c" run_launcher "$TMP/both_names" 2>&1) || true
+assert_contains "prefers new name" "Reading capabilities: $TMP/both_names/claude-docker-capabilities.conf" "$out"
+# Deprecation warning should NOT fire when the new file is present.
+if printf '%s' "$out" | grep -q "renamed to"; then
+  echo "  FAIL: deprecation warning fired even though new-name file was present"
+  fail=$((fail + 1))
+else
+  echo "  PASS: no deprecation warning when new-name file is present"
+  pass=$((pass + 1))
+fi
+
+echo "=== 23. ~/.evolvix fallback picks up Evolvix-generated file (evolvix#951+#952) ==="
+mkdir -p "$TMP/empty_cwd"
+mkdir -p "$TMP/fake_home/.evolvix"
+cat > "$TMP/fake_home/.evolvix/claude-docker-capabilities.conf" <<'CONF'
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+CONF
+out=$(HOME="$TMP/fake_home" run_launcher "$TMP/empty_cwd" 2>&1) || true
+assert_contains "falls back to ~/.evolvix" "Reading capabilities: $TMP/fake_home/.evolvix/claude-docker-capabilities.conf" "$out"
 
 echo "=== 19. --help-capabilities prints schema reference (evolvix#952) ==="
 out=$("$CLAUDE" --help-capabilities 2>&1)

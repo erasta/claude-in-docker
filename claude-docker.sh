@@ -867,22 +867,47 @@ done
 # Contract mode vs --auto vs error. --stop/--status skip this entirely
 # (they don't start a container).
 if [ "$STOP_MODE" != true ] && [ "$STATUS_MODE" != true ]; then
+  # Filename resolution (evolvix#952):
+  #   1. --capabilities-file explicit path (highest)
+  #   2. $PWD/claude-docker-capabilities.conf  (new canonical name)
+  #   3. $PWD/capabilities.conf                (DEPRECATED — one release fallback)
+  #   4. ~/.evolvix/claude-docker-capabilities.conf (Evolvix-generated default)
+  # `capabilities.conf` names the format, not its consumer; the new name
+  # ("claude-docker-capabilities.conf") tells you what reads it in a repo
+  # that has several kinds of config. The old name works for one release
+  # so operators with a hand-written file on disk aren't broken.
   if [ -z "$CAPABILITIES_FILE" ]; then
-    CAPABILITIES_FILE="$PWD/capabilities.conf"
+    if [ -f "$PWD/claude-docker-capabilities.conf" ]; then
+      CAPABILITIES_FILE="$PWD/claude-docker-capabilities.conf"
+    elif [ -f "$PWD/capabilities.conf" ]; then
+      CAPABILITIES_FILE="$PWD/capabilities.conf"
+      echo "WARNING: reading '$CAPABILITIES_FILE' — the file has been renamed to" >&2
+      echo "         'claude-docker-capabilities.conf' (evolvix#952). Rename or" >&2
+      echo "         regenerate with:" >&2
+      echo "           mv capabilities.conf claude-docker-capabilities.conf" >&2
+      echo "         The old name will stop being read one release after #952." >&2
+    elif [ -f "$HOME/.evolvix/claude-docker-capabilities.conf" ]; then
+      CAPABILITIES_FILE="$HOME/.evolvix/claude-docker-capabilities.conf"
+    else
+      CAPABILITIES_FILE="$PWD/claude-docker-capabilities.conf"
+    fi
   fi
   if [ "$AUTO_MODE" = true ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = true ]; then
     echo "ERROR: --auto and --capabilities-file are mutually exclusive." >&2
     exit 2
   fi
   if [ "$AUTO_MODE" = true ] && [ -f "$CAPABILITIES_FILE" ] && [ "$CAPABILITIES_FILE_EXPLICIT" = false ]; then
-    echo "ERROR: --auto passed but a capabilities.conf is present at $CAPABILITIES_FILE." >&2
+    echo "ERROR: --auto passed but a capabilities file is present at $CAPABILITIES_FILE." >&2
     echo "       These are mutually exclusive. Remove the file, or drop --auto." >&2
     exit 2
   fi
   if [ "$AUTO_MODE" = false ] && [ ! -f "$CAPABILITIES_FILE" ]; then
-    echo "ERROR: no capabilities.conf found at $CAPABILITIES_FILE." >&2
+    echo "ERROR: no capabilities file found. Looked at (in order):" >&2
+    echo "         \$PWD/claude-docker-capabilities.conf" >&2
+    echo "         \$PWD/capabilities.conf   (deprecated fallback)" >&2
+    echo "         \$HOME/.evolvix/claude-docker-capabilities.conf   (Evolvix default)" >&2
     echo "       Pass --auto to use host auto-detection (previous behaviour)," >&2
-    echo "       or generate a config: claude-docker.sh --generate-capabilities --output capabilities.conf" >&2
+    echo "       or generate: claude-docker.sh --generate-capabilities --output claude-docker-capabilities.conf" >&2
     echo "       See README (\"Capability contract\") for the format." >&2
     exit 2
   fi
