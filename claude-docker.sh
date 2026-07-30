@@ -1548,6 +1548,56 @@ if [ "$DAEMON_MODE" = true ]; then
     docker exec -u 0 "$CLAUDE_CONTAINER_NAME" \
       ln -sfn "$HOST_VENV" /opt/venv >/dev/null 2>&1 || \
       echo "WARN: could not link /opt/venv -> $HOST_VENV in $CLAUDE_CONTAINER_NAME" >&2
+
+    # Login-shell PATH persistence (evolvix#959). The image sets PATH to
+    # /opt/venv/bin:... via ENV, which non-login shells inherit. But a login
+    # shell (`bash -lc`) sources /etc/profile → /etc/environment → wipes PATH
+    # back to the distro default, so `python3` falls through to /usr/bin/
+    # python3 (=3.13 in the image) instead of /opt/venv/bin/python3 (=host
+    # venv's 3.11). Drop a profile.d snippet that prepends /opt/venv/bin
+    # unconditionally on login so both shell modes agree.
+    docker exec -u 0 "$CLAUDE_CONTAINER_NAME" \
+      bash -c 'echo "export PATH=/opt/venv/bin:\$PATH" > /etc/profile.d/opt-venv.sh && chmod 0644 /etc/profile.d/opt-venv.sh' \
+      >/dev/null 2>&1 || \
+      echo "WARN: could not write /etc/profile.d/opt-venv.sh in $CLAUDE_CONTAINER_NAME" >&2
+
+    # Python-version compatibility check (evolvix#959 §1b). Link-mode mounts
+    # the host venv's site-packages, but the container's `python3` interpreter
+    # is baked in the image. If they're different major.minor, `python3` looks
+    # under its own version's dist-packages and NEVER sees the mounted host
+    # site-packages — silently produces a container that can't import mounted
+    # packages. Fail loud, before the `import numpy, pytest` check below (which
+    # would fail anyway, but with a less specific error).
+    host_py_ver=""
+    for _venv_lib in "$HOST_VENV"/lib/python*/site-packages; do
+      [ -d "$_venv_lib" ] || continue
+      # Extract "python3.11" from ".../lib/python3.11/site-packages".
+      _ver_dir=$(basename "$(dirname "$_venv_lib")")
+      host_py_ver="${_ver_dir#python}"
+      break
+    done
+    if [ -n "$host_py_ver" ]; then
+      container_py_ver=$(docker exec "$CLAUDE_CONTAINER_NAME" \
+        python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' \
+        2>/dev/null || true)
+      if [ -n "$container_py_ver" ] && [ "$host_py_ver" != "$container_py_ver" ]; then
+        echo "ERROR: host venv python version ($host_py_ver from $HOST_VENV)" >&2
+        echo "       does not match container's python3 ($container_py_ver in" >&2
+        echo "       $IMAGE_NAME). Link mode mounts $HOST_VENV/lib/python$host_py_ver/" >&2
+        echo "       site-packages, but the container's python3 looks under" >&2
+        echo "       python$container_py_ver/dist-packages — mounted packages are" >&2
+        echo "       silently invisible." >&2
+        echo "" >&2
+        echo "       Fix (pick one):" >&2
+        echo "       * Rebuild $IMAGE_NAME on python$host_py_ver to match the host venv." >&2
+        echo "       * Recreate the host venv on python$container_py_ver:" >&2
+        echo "           python$container_py_ver -m venv \$HOME/environments/newvenv" >&2
+        echo "       * Use python_mode: copy (image's baked venv) and install pytest+numpy" >&2
+        echo "         in the image." >&2
+        exit 1
+      fi
+    fi
+
     # Fail-loud preflight: prove `python3` in the container can actually import
     # a basic package. A silent failure here is what let this bug go unnoticed
     # for six days; an assertion at start turns it into an immediate error.
