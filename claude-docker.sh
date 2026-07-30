@@ -83,7 +83,9 @@ CAP_ALLOWED = {
 }
 CAP_DEFAULTS = {"gpu": "none", "network_mode": "bridge", "python_mode": "link"}
 RES_KEYS = {"cli", "mounts", "env", "env_set"}
-TOP_KEYS = {"version", "capabilities", "resources"}
+# evolvix#952 4c: compose_files is a top-level list of docker compose files
+# the launcher's --daemon mode brings up before starting the worker.
+TOP_KEYS = {"version", "capabilities", "resources", "compose_files"}
 
 def die(msg):
     sys.stderr.write(f"ERROR: {PATH}: {msg}\n")
@@ -288,6 +290,25 @@ for name, spec in resources.items():
         emit_var(f"RES_{n}_env_set_{k}", str(v))
 
 emit_var("RES_NAMES", " ".join(resource_names))
+
+# evolvix#952 4c: compose_files — ordered list of docker compose files the
+# launcher's --daemon mode brings up before starting the worker. Emitted as a
+# newline-separated string in COMPOSE_FILES (empty when unset). Paths are
+# expanded (~, ${VAR}) at parse time; the file's own project name (top-level
+# `name:` field, or compose's default) determines the compose project — the
+# launcher never invents one.
+compose_files_raw = data.get("compose_files", [])
+if isinstance(compose_files_raw, dict):
+    die("`compose_files:` must be a list, not a mapping")
+if not isinstance(compose_files_raw, list):
+    compose_files_raw = [compose_files_raw] if compose_files_raw else []
+compose_files = []
+for p in compose_files_raw:
+    p_expanded = expand(str(p))
+    if not os.path.exists(p_expanded):
+        die(f"compose_files: '{p}' expands to '{p_expanded}' which does not exist on host")
+    compose_files.append(p_expanded)
+emit_var("COMPOSE_FILES", "\n".join(compose_files))
 PYPARSE
   )"; then
     exit 2
@@ -361,6 +382,53 @@ capabilities_apply_network() {
     none)   NETWORK_FLAG="--network none" ;;
   esac
   echo "==> Network: $CAP_network_mode (capability)"
+}
+
+# capabilities_apply_compose_files (evolvix#952 4c)
+# Bring up each file in $COMPOSE_FILES (newline-separated, ordered) with
+# `docker compose up -d`, idempotently — skip a file whose services are
+# already running under its detected compose project name.
+#
+# Compose project name resolution — WE NEVER INVENT ONE (evolvix#948 §1):
+#   1. Read from `docker compose -f <file> config --format json` (which resolves
+#      the file's top-level `name:` field or falls back to compose's default =
+#      the file's parent-dir basename). This is authoritative — same value
+#      `docker compose -f <file> up -d` would use with no `-p`.
+#
+# Idempotency check: `docker compose -f <file> -p <project> ps -q` returns the
+# IDs of RUNNING service containers under that project+file. Non-empty → the
+# stack is up, skip. This is the correct guard because recreating databases
+# while a dispatch runs would be the worst outcome available (evolvix#952 4c).
+capabilities_apply_compose_files() {
+  local file project running_ids
+  local -a files=()
+  # Split newline-separated COMPOSE_FILES into an array (bash-safe).
+  while IFS= read -r line; do
+    [ -n "$line" ] && files+=("$line")
+  done <<< "$COMPOSE_FILES"
+  [ ${#files[@]} -eq 0 ] && return 0
+
+  for file in "${files[@]}"; do
+    if ! project="$(docker compose -f "$file" config --format json 2>/dev/null | \
+                    python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null)"; then
+      project=""
+    fi
+    if [ -z "$project" ]; then
+      echo "ERROR: compose_files: could not detect compose project name for $file" >&2
+      echo "       (compose config failed — file syntactically broken?)" >&2
+      exit 2
+    fi
+    running_ids="$(docker compose -f "$file" -p "$project" ps -q 2>/dev/null || true)"
+    if [ -n "$running_ids" ]; then
+      echo "==> compose: $file (project: $project) — already running, skipping"
+      continue
+    fi
+    echo "==> compose: $file (project: $project) — bringing up"
+    if ! docker compose -f "$file" -p "$project" up -d; then
+      echo "ERROR: compose_files: docker compose up failed for $file" >&2
+      exit 2
+    fi
+  done
 }
 
 # capabilities_apply_resources
@@ -595,6 +663,18 @@ capabilities:
     link → mount the host venv/interpreter into the container read-only
            (fast; container tracks host changes; host uid must match)
     copy → use the image's baked venv (self-contained; slower to rebuild)
+
+compose_files:                            # OPTIONAL — top-level list of docker
+                                          # compose files --daemon brings up
+                                          # BEFORE the worker (evolvix#952 4c).
+                                          # Ordered; idempotent (skips a file
+                                          # whose services are already running).
+                                          # Compose project name comes from the
+                                          # file itself (top-level `name:` or
+                                          # compose's parent-dir default) —
+                                          # launcher NEVER invents one.
+  - ${EVOLVIX_ROOT}/docker-compose.yml
+  - ~/.evolvix/compose/workers/evolvix.yml
 
 resources:                                # OPEN-ENDED — add one entry per host
                                           # capability the container needs
@@ -949,7 +1029,16 @@ if [ -n "$ENV_FILE" ]; then
   ENV_FILE_FLAG="--env-file $ENV_FILE"
 fi
 
-# --daemon: if a worker is already running, report and exit before any setup.
+# --daemon: bring up any compose_files first (evolvix#952 4c), then check for
+# an existing worker. compose_files come first so backends are up before we
+# even consider whether the worker exists — if the worker file was listed in
+# compose_files, its container is already created by compose-up, and the next
+# block's "already running" check exits cleanly. If the worker wasn't in
+# compose_files (or compose_files was empty), the docker-run below creates it.
+if [ "$DAEMON_MODE" = true ] && [ "$AUTO_MODE" = false ]; then
+  # --auto mode has no COMPOSE_FILES (capabilities parsing was skipped).
+  capabilities_apply_compose_files
+fi
 if [ "$DAEMON_MODE" = true ]; then
   if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
     echo "Claude worker already running (container: $CLAUDE_CONTAINER_NAME)"

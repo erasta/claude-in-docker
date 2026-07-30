@@ -314,6 +314,81 @@ else
   pass=$((pass + 1))
 fi
 
+echo "=== 24. compose_files: parses as top-level list (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_ok"
+touch "$TMP/cf_ok/backends.yml" "$TMP/cf_ok/worker.yml"
+cat > "$TMP/cf_ok/capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+compose_files:
+  - $TMP/cf_ok/backends.yml
+  - $TMP/cf_ok/worker.yml
+CONF
+# Parse via `capabilities_parse` — needs bash source. Simplest end-to-end check:
+# invoke launcher in a way that reaches parse but stops before docker calls.
+# --update_environment triggers parse but its docker calls happen later.
+out=$(HOME="$TMP/cf_ok_home" run_launcher "$TMP/cf_ok" --update_environment 2>&1) || true
+# Success: no parse error for compose_files
+if printf '%s' "$out" | grep -qE "unknown top-level key|malformed|compose_files.*must be"; then
+  echo "  FAIL: parser rejected valid compose_files"
+  echo "    got: $(printf '%s' "$out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: compose_files: top-level list accepted"
+  pass=$((pass + 1))
+fi
+
+echo "=== 25. compose_files: missing file → parse-time error (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_missing"
+cat > "$TMP/cf_missing/capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+compose_files:
+  - /nonexistent/does-not-exist.yml
+CONF
+out=$(HOME="$TMP/cf_missing_home" run_launcher "$TMP/cf_missing" --update_environment 2>&1) || true
+assert_contains "missing compose file → error" "does not exist on host" "$out"
+
+echo "=== 26. compose_files: not-a-list → parse-time error (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_wrong"
+cat > "$TMP/cf_wrong/capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+compose_files:
+  key: value
+CONF
+out=$(HOME="$TMP/cf_wrong_home" run_launcher "$TMP/cf_wrong" --update_environment 2>&1) || true
+assert_contains "non-list compose_files → error" "compose_files" "$out"
+assert_contains "non-list compose_files → 'must be a list'" "must be a list" "$out"
+
+echo "=== 27. compose_files: absent is legal (no error, no invocation) (evolvix#952 4c) ==="
+mkdir -p "$TMP/cf_absent"
+cat > "$TMP/cf_absent/capabilities.conf" <<CONF
+version: 1
+capabilities:
+  gpu: none
+  network_mode: host
+CONF
+out=$(HOME="$TMP/cf_absent_home" run_launcher "$TMP/cf_absent" --update_environment 2>&1) || true
+if printf '%s' "$out" | grep -qE "unknown top-level key|malformed|compose_files"; then
+  echo "  FAIL: absent compose_files errored or invoked"
+  echo "    got: $(printf '%s' "$out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: compose_files: absent is legal"
+  pass=$((pass + 1))
+fi
+
+echo "=== 28. --help-capabilities mentions compose_files (evolvix#952 4c) ==="
+out=$("$CLAUDE" --help-capabilities 2>&1)
+assert_contains "help-cap: compose_files" "compose_files:" "$out"
+assert_contains "help-cap: compose_files rationale" "brings up" "$out"
+assert_contains "help-cap: never invents" "NEVER invents" "$out"
+
 echo "=== 23. ~/.evolvix fallback picks up Evolvix-generated file (evolvix#951+#952) ==="
 mkdir -p "$TMP/empty_cwd"
 mkdir -p "$TMP/fake_home/.evolvix"
