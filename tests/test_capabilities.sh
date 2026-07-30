@@ -242,6 +242,38 @@ assert_contains "help mentions --resource generator flag" "--resource" "$out"
 assert_contains "help mentions --python-mode" "python_mode" "$out"
 assert_contains "help documents names-only rule" "NAMES only" "$out"
 
+echo "=== 18. --generate-capabilities annotates every option (evolvix#952) ==="
+out=$("$CLAUDE" --generate-capabilities 2>&1)
+assert_contains "generate: help pointer" "--help-capabilities" "$out"
+assert_contains "generate: gpu option commented" "# gpu: nvidia | dri | kfd | none" "$out"
+assert_contains "generate: gpu nvidia effect" "requires nvidia runtime" "$out"
+assert_contains "generate: network_mode option commented" "# network_mode: host | bridge | none" "$out"
+assert_contains "generate: python_mode option commented" "# python_mode: link | copy" "$out"
+# Generated file must still parse cleanly against the launcher's own parser.
+tmp_gen="$TMP/generated"
+mkdir -p "$tmp_gen"
+"$CLAUDE" --generate-capabilities --output "$tmp_gen/capabilities.conf" >/dev/null 2>&1
+parse_out=$(run_launcher "$tmp_gen" 2>&1) || true
+if printf '%s' "$parse_out" | grep -q "unknown key\|malformed\|unsupported version\|ERROR:"; then
+  echo "  FAIL: parser rejected generator output (self-round-trip broken)"
+  echo "    got: $(printf '%s' "$parse_out" | head -c 500)"
+  fail=$((fail + 1))
+else
+  echo "  PASS: generator output round-trips through parser"
+  pass=$((pass + 1))
+fi
+
+echo "=== 19. --help-capabilities prints schema reference (evolvix#952) ==="
+out=$("$CLAUDE" --help-capabilities 2>&1)
+assert_contains "help-cap: title" "capabilities.conf — schema reference" "$out"
+assert_contains "help-cap: gpu enum" "gpu: nvidia | dri | kfd | none" "$out"
+assert_contains "help-cap: network enum" "network_mode: host | bridge | none" "$out"
+assert_contains "help-cap: python_mode enum" "python_mode: link | copy" "$out"
+assert_contains "help-cap: resources structure" "env_set:" "$out"
+assert_contains "help-cap: mount syntax" "host:container[:ro]" "$out"
+assert_contains "help-cap: --help mentions --help-capabilities" \
+                "--help-capabilities" "$("$CLAUDE" --help 2>&1)"
+
 echo
 echo "=== Summary: $pass passed, $fail failed ==="
 if [ "$fail" -gt 0 ]; then
