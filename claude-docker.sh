@@ -11,13 +11,12 @@ docker build -t "$IMAGE_NAME" -f - "$PROJECT_DIR" <<'EOF'
 FROM node:22-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl \
     && rm -rf /var/lib/apt/lists/*
 
 USER node
-ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
-ENV PATH=/home/node/.npm-global/bin:$PATH
-RUN npm install -g @anthropic-ai/claude-code@latest
+ENV PATH=/home/node/.local/bin:$PATH
+RUN curl -fsSL https://claude.ai/install.sh | bash
 EOF
 
 GPU_FLAG=""
