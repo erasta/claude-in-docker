@@ -17,7 +17,7 @@ RUN apt-get update \
 USER node
 ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
 ENV PATH=/home/node/.npm-global/bin:$PATH
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code@latest
 EOF
 
 GPU_FLAG=""
@@ -25,9 +25,12 @@ if docker info --format '{{.Runtimes}}' | grep -q nvidia; then
   GPU_FLAG="--gpus all"
 fi
 
+# Name like "claude-<project>-<random>" so multiple containers can run per project.
+CONTAINER_NAME="claude-$(basename "$PROJECT_DIR")-$(printf '%04x' $RANDOM)"
+
 echo "==> Starting Claude..."
 exec docker run -it --rm \
-  --name "claude-$(basename "$PROJECT_DIR")" \
+  --name "$CONTAINER_NAME" \
   --network host \
   $GPU_FLAG \
   -v "$PROJECT_DIR":"$PROJECT_DIR" \

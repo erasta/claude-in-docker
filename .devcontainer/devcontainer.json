@@ -22,6 +22,10 @@
   "containerEnv": {
     "TERM": "xterm-256color",
     "SSH_AUTH_SOCK": "",
+    "GIT_ASKPASS": "",
+    "VSCODE_GIT_ASKPASS_NODE": "",
+    "VSCODE_GIT_ASKPASS_MAIN": "",
+    "VSCODE_GIT_ASKPASS_EXTRA_ARGS": "",
     "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS": "true"
   },
   "postCreateCommand": "git config --global credential.helper ''",
