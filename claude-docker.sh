@@ -27,7 +27,7 @@ fi
 # Name like "claude-<project>-<random>" so multiple containers can run per project.
 CONTAINER_NAME="claude-$(basename "$PROJECT_DIR")-$(printf '%04x' $RANDOM)"
 
-echo "==> Starting Claude..."
+echo "==> Starting Claude on container ($CONTAINER_NAME)..."
 exec docker run -it --rm \
   --name "$CONTAINER_NAME" \
   --network host \
